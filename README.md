@@ -85,6 +85,14 @@ dashboard are out of its reach.
   positives (boolean `NEXT_PUBLIC_*PASSWORD*` flags, and committed env files holding only the Supabase local
   demo keys). 1.1.0 reports them as 3 warnings, and a test keeps real keys in such files an error.
 
+## Want more than six checks?
+
+vibe-preflight is the free part of a bigger kit I sell on Gumroad, the
+[Vibe App Production Kit](https://sunnatulladev.gumroad.com/l/vibe-app-production-kit) ($29). It has a
+21-check scanner (user-editable `plan`/`role` columns, views that skip RLS, `security definer` without
+`search_path`, middleware that blocks the Stripe webhook, and more), plus Claude Code and Cursor rules that
+keep the assistant from writing these bugs in the first place. The six checks here stay free and MIT.
+
 ## Development
 
 The scanner is written in TypeScript in `src/` and bundled with esbuild into
