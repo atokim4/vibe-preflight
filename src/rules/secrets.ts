@@ -8,6 +8,31 @@ const SECRET_NAME = /(SECRET|SERVICE_ROLE|PRIVATE|PASSWORD|PASSWD|DATABASE_URL|D
 const MAYBE_SECRET_NAME = /(API_KEY|TOKEN|ACCESS_KEY|_KEY$)/;
 const BROWSER_SAFE_NAME = /(ANON|PUBLISHABLE|PUBLIC_KEY|FIREBASE|MAPS|SITE_KEY|MEASUREMENT|POSTHOG|SENTRY_DSN|PUSHER_KEY|ALGOLIA_SEARCH|MAPBOX)/;
 
+const BOOL_VALUE = /^\s*["']?(?:true|false|0|1|yes|no|on|off)?["']?\s*$/i;
+const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+/**
+ * Feature flags such as `NEXT_PUBLIC_AUTH_PASSWORD=true` or `NEXT_PUBLIC_PASSWORD_REQUIRE_NUMBERS === 'true'`
+ * carry a secret-sounding word but only switch something on or off. True when every value the project gives the
+ * variable is a boolean and the code (if it reads it) only compares it to "true"/"false".
+ */
+function isBooleanFlag(name: string, sources: string[], envs: string[]): boolean {
+  const n = escapeRe(name);
+  const assigned = envs.flatMap((t) => [...t.matchAll(new RegExp(`^\\s*(?:export\\s+)?${n}\\s*=(.*)$`, "gm"))].map((m) => m[1]!));
+  if (assigned.some((v) => !BOOL_VALUE.test(v.replace(/\s+#.*$/, "")))) return false;
+  const word = new RegExp(`\\b${n}\\b`, "g");
+  const compared = new RegExp(`^${n}\\s*[!=]==?\\s*["'\`](?:true|false)["'\`]`);
+  const comparedBefore = /["'`](?:true|false)["'`]\s*[!=]==?\s*(?:process\.env\.|import\.meta\.env\.)?$/;
+  let uses = 0;
+  for (const t of sources) {
+    for (const m of t.matchAll(word)) {
+      uses++;
+      if (!compared.test(t.slice(m.index)) && !comparedBefore.test(t.slice(Math.max(0, m.index - 40), m.index))) return false;
+    }
+  }
+  return uses > 0 || assigned.some((v) => v.trim() !== "");
+}
+
 export const publicEnvSecret: Rule = {
   id: "public-env-secret",
   severity: "error",
@@ -20,13 +45,17 @@ export const publicEnvSecret: Rule = {
     const first = new Map<string, { file: string; line: number }>();
     // Source files first, so a finding points at the code that reads the variable when there is one.
     const files = [...project.files.filter((f) => f.kind === "source" && !isTestFile(f)), ...project.files.filter((f) => f.kind === "env")];
+    const sources: string[] = [];
+    const envs: string[] = [];
     for (const f of files) {
       const text = f.kind === "source" ? stripJsComments(f.text) : f.text;
+      (f.kind === "source" ? sources : envs).push(text);
       for (const m of text.matchAll(re)) if (!first.has(m[0])) first.set(m[0], { file: f.path, line: lineAt(text, m.index) });
     }
     const out: Finding[] = [];
     for (const [name, at] of first) {
       const bare = prefixes.reduce((n, p) => (n.startsWith(p) ? n.slice(p.length) : n), name);
+      if ((SECRET_NAME.test(bare) || MAYBE_SECRET_NAME.test(bare)) && isBooleanFlag(name, sources, envs)) continue;
       if (SECRET_NAME.test(bare)) {
         out.push({ rule: this.id, severity: "error", message: `\`${name}\` looks like a secret and is exposed to the browser.`, ...at });
       } else if (MAYBE_SECRET_NAME.test(bare) && !BROWSER_SAFE_NAME.test(bare)) {
@@ -91,6 +120,46 @@ export function isIgnored(gitignore: string | undefined, name: string): boolean 
 const TEMPLATE_ENV = /\.(example|sample|template|dist)$/;
 const HAS_VALUE = /^\s*(?:export\s+)?[A-Za-z_][A-Za-z0-9_]*\s*=\s*\S/m;
 
+/** Key formats that are real credentials wherever they appear. */
+const REAL_KEY = /\b(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{8,}|\bwhsec_[A-Za-z0-9]{8,}|\bsb_secret_[A-Za-z0-9_-]{8,}|\bsk-[A-Za-z0-9_-]{20,}|\bAKIA[A-Z0-9]{16}\b|\bgh[pousr]_[A-Za-z0-9]{20,}/;
+const JWT_ANY = /\beyJ[A-Za-z0-9_-]+\.eyJ/;
+const JWT = /\beyJ[A-Za-z0-9_-]+\.(eyJ[A-Za-z0-9_-]+)\.[A-Za-z0-9_-]+/g;
+
+function jwtIssuer(payload: string): string | undefined {
+  try {
+    return (JSON.parse(Buffer.from(payload, "base64url").toString("utf8")) as { iss?: unknown }).iss as string | undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * The Supabase CLI prints the same anon and service_role keys for every local stack (issuer "supabase-demo").
+ * Starters commit them on purpose. A file is "local defaults" when it has at least one such key and no other JWT
+ * or real-looking credential.
+ */
+export function onlyLocalSupabaseKeys(text: string): boolean {
+  if (REAL_KEY.test(text)) return false;
+  const issuers = [...text.matchAll(JWT)].map((m) => jwtIssuer(m[1]!));
+  return issuers.length > 0 && issuers.every((iss) => iss === "supabase-demo");
+}
+
+type EnvValueKind = "secret" | "local-supabase" | "public-only";
+
+const ENV_KIND_NOTE: Record<EnvValueKind, string> = {
+  secret: "",
+  "local-supabase": " Its keys are the public Supabase local-dev defaults, which is fine; make sure real project keys never go in this file.",
+  "public-only": " It only sets browser-exposed variables, which ship in the bundle anyway; keep it that way, or real keys added later get committed too.",
+};
+
+/** What an env file holds: anything that may be a real secret, only Supabase local defaults, or only public variables. */
+function envValueKind(text: string, prefixes: string[]): EnvValueKind {
+  if (onlyLocalSupabaseKeys(text)) return "local-supabase";
+  const names = [...text.matchAll(/^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*\S/gm)].map((m) => m[1]!);
+  if (names.length > 0 && names.every((n) => prefixes.some((p) => n.startsWith(p))) && !REAL_KEY.test(text) && !JWT_ANY.test(text)) return "public-only";
+  return "secret";
+}
+
 export const envFileCommitted: Rule = {
   id: "env-file-committed",
   severity: "error",
@@ -99,30 +168,29 @@ export const envFileCommitted: Rule = {
   fix: "Add `.env*` and `!.env.example` to `.gitignore`. If git already tracks the file, run `git rm --cached <file>`, commit, and rotate every key that was in it.",
   check(project) {
     const out: Finding[] = [];
+    const prefixes = publicPrefixes(project);
+    const push = (f: { path: string; text: string }, where: string) => {
+      const kind = envValueKind(f.text, prefixes);
+      out.push({
+        rule: this.id,
+        severity: kind === "secret" ? this.severity : "warning",
+        message: `${where}.${ENV_KIND_NOTE[kind]}`,
+        file: f.path,
+        line: 1,
+      });
+    };
     for (const f of project.files) {
       if (f.kind !== "env" || TEMPLATE_ENV.test(f.path) || !HAS_VALUE.test(f.text)) continue;
       if (project.git) {
         // git knows the truth, including nested and global ignore rules.
         const tracked = project.git.tracked.has(f.path);
         if (!tracked && project.git.ignored.has(f.path)) continue;
-        out.push({
-          rule: this.id,
-          severity: this.severity,
-          message: tracked ? `\`${f.path}\` is committed to git.` : `\`${f.path}\` is not ignored by git, so \`git add .\` will commit it.`,
-          file: f.path,
-          line: 1,
-        });
+        push(f, tracked ? `\`${f.path}\` is committed to git` : `\`${f.path}\` is not ignored by git, so \`git add .\` will commit it`);
         continue;
       }
       // No git repo: read the root .gitignore (root-level env files only).
       if (f.path.includes("/") || isIgnored(project.gitignore, f.path)) continue;
-      out.push({
-        rule: this.id,
-        severity: this.severity,
-        message: project.gitignore ? `\`${f.path}\` is not in .gitignore, so \`git add .\` will commit it.` : `\`${f.path}\` exists and the project has no .gitignore.`,
-        file: f.path,
-        line: 1,
-      });
+      push(f, project.gitignore ? `\`${f.path}\` is not in .gitignore, so \`git add .\` will commit it` : `\`${f.path}\` exists and the project has no .gitignore`);
     }
     return out;
   },

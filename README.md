@@ -32,9 +32,9 @@ node .claude/skills/vibe-preflight/scripts/preflight.mjs path/to/app
 | `rls-disabled` | error | A table in `public` created in a migration with no `enable row level security` anywhere later |
 | `rls-permissive-policy` | error on write, warning on read | `using (true)` / `with check (true)` policies |
 | `server-secret-in-client` | error | `SUPABASE_SERVICE_ROLE_KEY`, `'service_role'` or a Stripe secret in browser code (`"use client"` files in Next.js, `src/` in Vite/Expo) |
-| `public-env-secret` | error / warning | Secret-looking names behind `NEXT_PUBLIC_`, `VITE_` or `EXPO_PUBLIC_` |
+| `public-env-secret` | error / warning | Secret-looking names behind `NEXT_PUBLIC_`, `VITE_` or `EXPO_PUBLIC_` (boolean flags such as `NEXT_PUBLIC_AUTH_PASSWORD=true` are skipped) |
 | `stripe-webhook-unverified` | error | A webhook handler that acts on Stripe events without `constructEvent` / `constructEventAsync` |
-| `env-file-committed` | error | An `.env*` file with values that git tracks or doesn't ignore |
+| `env-file-committed` | error / warning | An `.env*` file with values that git tracks or doesn't ignore. Warning only when it holds just the Supabase CLI's local demo keys or just public variables |
 
 `SKILL.md` explains each one with the fix. The scanner also prints the why and the fix with `--explain`.
 
@@ -74,6 +74,9 @@ dashboard are out of its reach.
 - Two public Supabase + Stripe starters, `vercel/nextjs-subscription-payments` and
   `KolbySisk/next-supabase-stripe-starter`: no errors. Each gets warnings for the public read policies on
   its `products` and `prices` tables, which are meant to be public.
+- `makerkit/next-supabase-saas-kit-lite`: version 1.0.0 reported 7 errors there and all 7 were false
+  positives (boolean `NEXT_PUBLIC_*PASSWORD*` flags, and committed env files holding only the Supabase local
+  demo keys). 1.1.0 reports them as 3 warnings, and a test keeps real keys in such files an error.
 
 ## Development
 
@@ -82,7 +85,7 @@ The scanner is written in TypeScript in `src/` and bundled with esbuild into
 
 ```bash
 npm install
-npm run check   # typecheck, build, 28 Vitest tests
+npm run check   # typecheck, build, 30 Vitest tests
 ```
 
 Tests are in `test/`: rule unit tests, the two example apps, git-tracked env files in a temporary repo, and

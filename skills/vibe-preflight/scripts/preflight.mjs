@@ -384,6 +384,24 @@ function publicPrefixes(project) {
 var SECRET_NAME = /(SECRET|SERVICE_ROLE|PRIVATE|PASSWORD|PASSWD|DATABASE_URL|DB_URL|POSTGRES_URL|WEBHOOK_SIGNING|_SK$|SIGNING_KEY)/;
 var MAYBE_SECRET_NAME = /(API_KEY|TOKEN|ACCESS_KEY|_KEY$)/;
 var BROWSER_SAFE_NAME = /(ANON|PUBLISHABLE|PUBLIC_KEY|FIREBASE|MAPS|SITE_KEY|MEASUREMENT|POSTHOG|SENTRY_DSN|PUSHER_KEY|ALGOLIA_SEARCH|MAPBOX)/;
+var BOOL_VALUE = /^\s*["']?(?:true|false|0|1|yes|no|on|off)?["']?\s*$/i;
+var escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+function isBooleanFlag(name, sources, envs) {
+  const n = escapeRe(name);
+  const assigned = envs.flatMap((t) => [...t.matchAll(new RegExp(`^\\s*(?:export\\s+)?${n}\\s*=(.*)$`, "gm"))].map((m) => m[1]));
+  if (assigned.some((v) => !BOOL_VALUE.test(v.replace(/\s+#.*$/, "")))) return false;
+  const word = new RegExp(`\\b${n}\\b`, "g");
+  const compared = new RegExp(`^${n}\\s*[!=]==?\\s*["'\`](?:true|false)["'\`]`);
+  const comparedBefore = /["'`](?:true|false)["'`]\s*[!=]==?\s*(?:process\.env\.|import\.meta\.env\.)?$/;
+  let uses = 0;
+  for (const t of sources) {
+    for (const m of t.matchAll(word)) {
+      uses++;
+      if (!compared.test(t.slice(m.index)) && !comparedBefore.test(t.slice(Math.max(0, m.index - 40), m.index))) return false;
+    }
+  }
+  return uses > 0 || assigned.some((v) => v.trim() !== "");
+}
 var publicEnvSecret = {
   id: "public-env-secret",
   severity: "error",
@@ -395,13 +413,17 @@ var publicEnvSecret = {
     const re = new RegExp(`\\b(?:${prefixes.join("|")})[A-Z0-9_]+`, "g");
     const first = /* @__PURE__ */ new Map();
     const files = [...project.files.filter((f) => f.kind === "source" && !isTestFile(f)), ...project.files.filter((f) => f.kind === "env")];
+    const sources = [];
+    const envs = [];
     for (const f of files) {
       const text2 = f.kind === "source" ? stripJsComments(f.text) : f.text;
+      (f.kind === "source" ? sources : envs).push(text2);
       for (const m of text2.matchAll(re)) if (!first.has(m[0])) first.set(m[0], { file: f.path, line: lineAt(text2, m.index) });
     }
     const out = [];
     for (const [name, at] of first) {
       const bare = prefixes.reduce((n, p) => n.startsWith(p) ? n.slice(p.length) : n, name);
+      if ((SECRET_NAME.test(bare) || MAYBE_SECRET_NAME.test(bare)) && isBooleanFlag(name, sources, envs)) continue;
       if (SECRET_NAME.test(bare)) {
         out.push({ rule: this.id, severity: "error", message: `\`${name}\` looks like a secret and is exposed to the browser.`, ...at });
       } else if (MAYBE_SECRET_NAME.test(bare) && !BROWSER_SAFE_NAME.test(bare)) {
@@ -460,6 +482,32 @@ function isIgnored(gitignore, name) {
 }
 var TEMPLATE_ENV = /\.(example|sample|template|dist)$/;
 var HAS_VALUE = /^\s*(?:export\s+)?[A-Za-z_][A-Za-z0-9_]*\s*=\s*\S/m;
+var REAL_KEY = /\b(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{8,}|\bwhsec_[A-Za-z0-9]{8,}|\bsb_secret_[A-Za-z0-9_-]{8,}|\bsk-[A-Za-z0-9_-]{20,}|\bAKIA[A-Z0-9]{16}\b|\bgh[pousr]_[A-Za-z0-9]{20,}/;
+var JWT_ANY = /\beyJ[A-Za-z0-9_-]+\.eyJ/;
+var JWT = /\beyJ[A-Za-z0-9_-]+\.(eyJ[A-Za-z0-9_-]+)\.[A-Za-z0-9_-]+/g;
+function jwtIssuer(payload) {
+  try {
+    return JSON.parse(Buffer.from(payload, "base64url").toString("utf8")).iss;
+  } catch {
+    return void 0;
+  }
+}
+function onlyLocalSupabaseKeys(text2) {
+  if (REAL_KEY.test(text2)) return false;
+  const issuers = [...text2.matchAll(JWT)].map((m) => jwtIssuer(m[1]));
+  return issuers.length > 0 && issuers.every((iss) => iss === "supabase-demo");
+}
+var ENV_KIND_NOTE = {
+  secret: "",
+  "local-supabase": " Its keys are the public Supabase local-dev defaults, which is fine; make sure real project keys never go in this file.",
+  "public-only": " It only sets browser-exposed variables, which ship in the bundle anyway; keep it that way, or real keys added later get committed too."
+};
+function envValueKind(text2, prefixes) {
+  if (onlyLocalSupabaseKeys(text2)) return "local-supabase";
+  const names = [...text2.matchAll(/^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*\S/gm)].map((m) => m[1]);
+  if (names.length > 0 && names.every((n) => prefixes.some((p) => n.startsWith(p))) && !REAL_KEY.test(text2) && !JWT_ANY.test(text2)) return "public-only";
+  return "secret";
+}
 var envFileCommitted = {
   id: "env-file-committed",
   severity: "error",
@@ -468,28 +516,27 @@ var envFileCommitted = {
   fix: "Add `.env*` and `!.env.example` to `.gitignore`. If git already tracks the file, run `git rm --cached <file>`, commit, and rotate every key that was in it.",
   check(project) {
     const out = [];
+    const prefixes = publicPrefixes(project);
+    const push = (f, where) => {
+      const kind = envValueKind(f.text, prefixes);
+      out.push({
+        rule: this.id,
+        severity: kind === "secret" ? this.severity : "warning",
+        message: `${where}.${ENV_KIND_NOTE[kind]}`,
+        file: f.path,
+        line: 1
+      });
+    };
     for (const f of project.files) {
       if (f.kind !== "env" || TEMPLATE_ENV.test(f.path) || !HAS_VALUE.test(f.text)) continue;
       if (project.git) {
         const tracked = project.git.tracked.has(f.path);
         if (!tracked && project.git.ignored.has(f.path)) continue;
-        out.push({
-          rule: this.id,
-          severity: this.severity,
-          message: tracked ? `\`${f.path}\` is committed to git.` : `\`${f.path}\` is not ignored by git, so \`git add .\` will commit it.`,
-          file: f.path,
-          line: 1
-        });
+        push(f, tracked ? `\`${f.path}\` is committed to git` : `\`${f.path}\` is not ignored by git, so \`git add .\` will commit it`);
         continue;
       }
       if (f.path.includes("/") || isIgnored(project.gitignore, f.path)) continue;
-      out.push({
-        rule: this.id,
-        severity: this.severity,
-        message: project.gitignore ? `\`${f.path}\` is not in .gitignore, so \`git add .\` will commit it.` : `\`${f.path}\` exists and the project has no .gitignore.`,
-        file: f.path,
-        line: 1
-      });
+      push(f, project.gitignore ? `\`${f.path}\` is not in .gitignore, so \`git add .\` will commit it` : `\`${f.path}\` exists and the project has no .gitignore`);
     }
     return out;
   }

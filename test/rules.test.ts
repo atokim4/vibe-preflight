@@ -99,6 +99,15 @@ describe("public-env-secret", () => {
     expect(only(findings(dir), "public-env-secret").map((f) => `${f.severity} ${f.line}`)).toEqual(["error 5", "warning 4"]);
   });
 
+  it("skips boolean feature flags with secret-sounding names", () => {
+    const dir = project({
+      ...NEXT_SUPABASE,
+      ".env.example": "NEXT_PUBLIC_AUTH_PASSWORD=true\nNEXT_PUBLIC_SECRET_MODE=1\n",
+      "lib/auth.ts": "export const password = process.env.NEXT_PUBLIC_AUTH_PASSWORD === 'true';\nexport const nums = process.env.NEXT_PUBLIC_PASSWORD_REQUIRE_NUMBERS === \"true\";\nexport const mode = process.env.NEXT_PUBLIC_SECRET_MODE;\n",
+    });
+    expect(only(findings(dir), "public-env-secret").map((f) => f.message)).toEqual(["`NEXT_PUBLIC_SECRET_MODE` looks like a secret and is exposed to the browser."]);
+  });
+
   it("only checks the prefixes of the detected framework", () => {
     const dir = project({ ...NEXT_SUPABASE, ".env.example": "VITE_STRIPE_SECRET_KEY=\n" });
     expect(only(findings(dir), "public-env-secret")).toEqual([]);
@@ -138,6 +147,25 @@ describe("env-file-committed (no git repo)", () => {
   it("flags a root .env with values that .gitignore doesn't cover", () => {
     const dir = project({ "package.json": "{}", ".gitignore": "node_modules\n", ".env": "KEY=value\n", ".env.example": "KEY=placeholder\n", ".env.test": "\n" });
     expect(only(findings(dir), "env-file-committed").map((f) => f.message)).toEqual(["`.env` is not in .gitignore, so `git add .` will commit it."]);
+  });
+
+  it("downgrades files with only Supabase local keys or only public variables to warnings", () => {
+    const b64 = (o: object) => Buffer.from(JSON.stringify(o)).toString("base64url");
+    const jwt = (iss: string) => `${b64({ alg: "HS256", typ: "JWT" })}.${b64({ iss, role: "service_role" })}.c2lnbmF0dXJl`;
+    const dir = project({
+      ...NEXT_SUPABASE,
+      ".gitignore": "node_modules\n",
+      ".env": "NEXT_PUBLIC_SITE_URL=http://localhost:3000\nNEXT_PUBLIC_AUTH_PASSWORD=true\n",
+      ".env.development": `NEXT_PUBLIC_SUPABASE_URL=http://127.0.0.1:54321\nSUPABASE_SERVICE_ROLE_KEY=${jwt("supabase-demo")}\n`,
+      ".env.local": `SUPABASE_SERVICE_ROLE_KEY=${jwt("supabase")}\n`,
+      ".env.production": `SUPABASE_SERVICE_ROLE_KEY=${jwt("supabase-demo")}\nSTRIPE_SECRET_KEY=${["sk", "live", "x".repeat(16)].join("_")}\n`,
+    });
+    expect(only(findings(dir), "env-file-committed").map((f) => `${f.severity} ${f.file}`).sort()).toEqual([
+      "error .env.local",
+      "error .env.production",
+      "warning .env",
+      "warning .env.development",
+    ]);
   });
 
   it("respects negation and reports a missing .gitignore", () => {
