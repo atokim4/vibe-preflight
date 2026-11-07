@@ -1,5 +1,6 @@
 import { afterAll, describe, expect, it } from "vitest";
 import { spawnSync } from "node:child_process";
+import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { cleanup, example, ROOT } from "./helpers.ts";
 
@@ -16,6 +17,13 @@ const broken = example("broken-app");
 const fixed = example("fixed-app");
 
 describe("preflight.mjs", () => {
+  it("reports the version from package.json and the plugin manifests", () => {
+    const read = (file: string) => JSON.parse(readFileSync(join(ROOT, file), "utf8")) as { version: string };
+    const version = read("package.json").version;
+    expect(run("--version").out.trim()).toBe(version);
+    expect(read(".claude-plugin/plugin.json").version).toBe(version);
+  });
+
   it("exits 1 on errors and 0 on a clean project", () => {
     const bad = run(broken);
     expect(bad.code).toBe(1);

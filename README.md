@@ -16,6 +16,13 @@ webhooks that trust any POST.
 npx skills add atokim4/vibe-preflight
 ```
 
+Or as a Claude Code plugin (the repo is its own plugin marketplace):
+
+```
+/plugin marketplace add atokim4/vibe-preflight
+/plugin install vibe-preflight@atokim4-vibe-preflight
+```
+
 Then ask your agent something like "run vibe-preflight before we deploy". You can also run the scanner
 yourself, with Node 20 or newer:
 
@@ -85,7 +92,7 @@ The scanner is written in TypeScript in `src/` and bundled with esbuild into
 
 ```bash
 npm install
-npm run check   # typecheck, build, 30 Vitest tests
+npm run check   # typecheck, build, 31 Vitest tests
 ```
 
 Tests are in `test/`: rule unit tests, the two example apps, git-tracked env files in a temporary repo, and

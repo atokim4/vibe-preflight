@@ -21,11 +21,14 @@ Skip it for projects with neither Supabase nor Stripe; only the env checks would
 
 ## How to run it
 
-From the project root (replace `<skill-dir>` with this skill's folder):
+From the project root:
 
 ```bash
-node <skill-dir>/scripts/preflight.mjs . --format json
+node ${CLAUDE_SKILL_DIR}/scripts/preflight.mjs . --format json
 ```
+
+Claude Code fills in `${CLAUDE_SKILL_DIR}` (also for a plugin install). In other agents use this skill's
+folder instead, e.g. `.agents/skills/vibe-preflight` or `.claude/skills/vibe-preflight`.
 
 Use `--format json` when you will read the result yourself, plain text (`--explain` adds why + fix) when you
 show it to the user. Exit code: `0` no errors, `1` errors found, `2` bad arguments. Other flags:

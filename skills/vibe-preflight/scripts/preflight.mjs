@@ -614,7 +614,7 @@ function counts(findings) {
 }
 
 // src/report.ts
-var VERSION = "1.0.0";
+var VERSION = "1.1.1";
 var plural = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
 function summary(r) {
   const c = counts(r.findings);
