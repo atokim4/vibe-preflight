@@ -1,0 +1,20 @@
+{
+  "name": "vibe-preflight",
+  "description": "Six pre-launch security checks for Supabase + Stripe apps, with a zero-dependency Node scanner and fix steps for each finding.",
+  "version": "1.1.2",
+  "author": {
+    "name": "Sunnatulla"
+  },
+  "homepage": "https://github.com/atokim4/vibe-preflight",
+  "repository": "https://github.com/atokim4/vibe-preflight",
+  "license": "MIT",
+  "keywords": [
+    "supabase",
+    "stripe",
+    "security",
+    "rls",
+    "nextjs",
+    "vite"
+  ],
+  "skills": "./skills/"
+}
