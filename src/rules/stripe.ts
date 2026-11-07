@@ -4,6 +4,8 @@ import { lineAt, stripJsComments } from "../text.ts";
 
 const EVENT_NAME = /["'`](checkout\.session\.completed|customer\.subscription\.[a-z_]+|invoice\.(?:paid|payment_succeeded|payment_failed)|payment_intent\.succeeded)["'`]/;
 const VERIFIED = /\bconstructEvent(?:Async)?\s*\(/;
+// Reading the header, not just naming it: a CORS helper that lists `stripe-signature` in Allow-Headers isn't a handler.
+const READS_SIGNATURE = /headers(?:\(\))?\s*(?:\.get\s*\(\s*|\[\s*)["'`]stripe-signature["'`]/i;
 
 /** Server files that receive Stripe webhooks. */
 export function stripeWebhookFiles(project: Project): SourceFile[] {
@@ -15,7 +17,7 @@ export function stripeWebhookFiles(project: Project): SourceFile[] {
     // so Clerk, Supabase or Lemon Squeezy webhooks aren't mistaken for Stripe ones.
     if (EVENT_NAME.test(code) && /\b(POST|handler|serve|Deno\.serve|export default)\b/.test(code)) return true;
     if (!namesStripe) return false;
-    return /stripe-signature/i.test(code) || (/webhook/i.test(f.path) && /\bevent\b/.test(code));
+    return READS_SIGNATURE.test(code) || (/webhook/i.test(f.path) && /\bevent\b/.test(code));
   });
 }
 

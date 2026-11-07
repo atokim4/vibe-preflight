@@ -1,6 +1,6 @@
 {
   "name": "vibe-preflight",
-  "version": "1.1.1",
+  "version": "1.1.2",
   "private": true,
   "description": "Agent Skill + zero-dependency scanner: 6 pre-launch security checks for Supabase + Stripe apps.",
   "type": "module",

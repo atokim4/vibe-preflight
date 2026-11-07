@@ -2,7 +2,7 @@ import type { Rule, Severity } from "./types.ts";
 import { counts, type ScanResult } from "./scan.ts";
 import { allRules } from "./rules/index.ts";
 
-export const VERSION = "1.1.1";
+export const VERSION = "1.1.2";
 
 const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? "" : "s"}`;
 

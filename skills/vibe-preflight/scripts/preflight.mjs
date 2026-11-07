@@ -545,6 +545,7 @@ var envFileCommitted = {
 // src/rules/stripe.ts
 var EVENT_NAME = /["'`](checkout\.session\.completed|customer\.subscription\.[a-z_]+|invoice\.(?:paid|payment_succeeded|payment_failed)|payment_intent\.succeeded)["'`]/;
 var VERIFIED = /\bconstructEvent(?:Async)?\s*\(/;
+var READS_SIGNATURE = /headers(?:\(\))?\s*(?:\.get\s*\(\s*|\[\s*)["'`]stripe-signature["'`]/i;
 function stripeWebhookFiles(project) {
   return project.files.filter((f) => {
     if (f.kind !== "source" || isTestFile(f) || isClientFile(project, f)) return false;
@@ -552,7 +553,7 @@ function stripeWebhookFiles(project) {
     const namesStripe = /stripe/i.test(code) || /stripe/i.test(f.path);
     if (EVENT_NAME.test(code) && /\b(POST|handler|serve|Deno\.serve|export default)\b/.test(code)) return true;
     if (!namesStripe) return false;
-    return /stripe-signature/i.test(code) || /webhook/i.test(f.path) && /\bevent\b/.test(code);
+    return READS_SIGNATURE.test(code) || /webhook/i.test(f.path) && /\bevent\b/.test(code);
   });
 }
 var webhookUnverified = {
@@ -614,7 +615,7 @@ function counts(findings) {
 }
 
 // src/report.ts
-var VERSION = "1.1.1";
+var VERSION = "1.1.2";
 var plural = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
 function summary(r) {
   const c = counts(r.findings);

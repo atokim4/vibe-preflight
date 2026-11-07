@@ -137,6 +137,13 @@ describe("stripe-webhook-unverified", () => {
     expect(only(findings(dir), "stripe-webhook-unverified")).toEqual([]);
   });
 
+  it("ignores a CORS helper that only lists the stripe-signature header", () => {
+    const cors = 'import { NextResponse } from "next/server";\n// Stripe\nconst headers = { "Access-Control-Allow-Headers": "Content-Type, stripe-signature" };\nexport function withCors(h: Function) { return h; }\n';
+    const reads = 'import Stripe from "stripe";\nexport async function POST(req: Request) {\n  const sig = req.headers.get("Stripe-Signature");\n  const event = await req.json();\n}\n';
+    const dir = project({ ...NEXT_SUPABASE, "utils/cors.ts": cors, "app/api/pay/route.ts": reads });
+    expect(only(findings(dir), "stripe-webhook-unverified").map((f) => f.file)).toEqual(["app/api/pay/route.ts"]);
+  });
+
   it("ignores client code that only names an event", () => {
     const dir = project({ ...NEXT_SUPABASE, "components/plan.tsx": '"use client";\nimport { loadStripe } from "@stripe/stripe-js";\nconst e = "checkout.session.completed";\nexport default function P() { return null; }\n' });
     expect(only(findings(dir), "stripe-webhook-unverified")).toEqual([]);
