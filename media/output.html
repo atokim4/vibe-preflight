@@ -1,0 +1,30 @@
+<!doctype html><meta charset="utf-8"><style>
+body{margin:0;background:#0d1117;font:14px/1.5 "DejaVu Sans Mono",ui-monospace,monospace;color:#e6edf3}
+.win{margin:28px;border-radius:10px;background:#161b22;box-shadow:0 10px 40px #0008;overflow:hidden}
+.bar{height:34px;background:#21262d;display:flex;align-items:center;gap:8px;padding:0 14px;color:#8b949e;font-size:13px}
+.dot{width:12px;height:12px;border-radius:50%}.r{background:#ff5f56}.y{background:#ffbd2e}.g{background:#27c93f}
+pre{margin:0;padding:18px 22px;white-space:pre-wrap}.b{font-weight:700}.dim{color:#8b949e}.red{color:#ff7b72;font-weight:700}.yel{color:#e3b341;font-weight:700}.grn{color:#3fb950;font-weight:700}.cyan{color:#79c0ff}.p{color:#3fb950}
+</style><div class="win"><div class="bar"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>&nbsp; ~/broken-app</div><pre><span class="p">$</span> node .claude/skills/vibe-preflight/scripts/preflight.mjs .
+
+<span class="b">vibe-preflight 1.0.0</span><span class="dim"> · broken-app · 5 source files, 1 SQL file · 6 checks</span>
+
+<span class="red">error  </span> <span class="dim">.env.local:1</span>
+        `.env.local` is not in .gitignore, so `git add .` will commit it. <span class="dim">[env-file-committed]</span>
+<span class="red">error  </span> <span class="dim">src/app/api/stripe/webhook/route.ts:8</span>
+        Handles Stripe events without `constructEvent`, so any POST is trusted. <span class="dim">[stripe-webhook-unverified]</span>
+<span class="red">error  </span> <span class="dim">src/components/admin-notes.tsx:7</span>
+        admin-notes.tsx runs in the browser and uses `SUPABASE_SERVICE_ROLE_KEY`. <span class="dim">[server-secret-in-client]</span>
+<span class="red">error  </span> <span class="dim">src/lib/stripe.ts:3</span>
+        `NEXT_PUBLIC_STRIPE_SECRET_KEY` looks like a secret and is exposed to the browser. <span class="dim">[public-env-secret]</span>
+<span class="red">error  </span> <span class="dim">supabase/migrations/20261101000000_init.sql:8</span>
+        Policy "Enable insert for authenticated users only" on `public.profiles` (insert) lets any signed-in user write rows on behalf of any user. <span class="dim">[rls-permissive-policy]</span>
+<span class="red">error  </span> <span class="dim">supabase/migrations/20261101000000_init.sql:14</span>
+        `public.notes` is created without `enable row level security` in any migration. <span class="dim">[rls-disabled]</span>
+<span class="yel">warning</span> <span class="dim">src/components/summarize-button.tsx:7</span>
+        `NEXT_PUBLIC_OPENAI_API_KEY` is exposed to the browser. Fine for a publishable key, a leak if it's a paid API key (OpenAI, Resend, …). <span class="dim">[public-env-secret]</span>
+<span class="yel">warning</span> <span class="dim">supabase/migrations/20261101000000_init.sql:11</span>
+        Policy "Enable read access for all users" on `public.profiles` (select) lets anyone (signed in or not) read every row. <span class="dim">[rls-permissive-policy]</span>
+
+<span class="red">6 errors, 2 warnings</span>
+<span class="dim">Run with --explain for why each one matters and how to fix it.</span>
+</pre></div>

@@ -1,0 +1,23 @@
+{
+  "name": "vibe-preflight",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Agent Skill + zero-dependency scanner: 6 pre-launch security checks for Supabase + Stripe apps.",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "esbuild src/cli.ts --bundle --platform=node --format=esm --target=node20 --outfile=skills/vibe-preflight/scripts/preflight.mjs --banner:js=\"#!/usr/bin/env node\"",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "check": "npm run typecheck && npm run build && npm test"
+  },
+  "devDependencies": {
+    "@types/node": "22.20.5",
+    "esbuild": "0.28.2",
+    "typescript": "5.9.3",
+    "vitest": "5.1.0"
+  }
+}

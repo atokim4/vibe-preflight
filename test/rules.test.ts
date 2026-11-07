@@ -1,0 +1,147 @@
+import { afterAll, describe, expect, it } from "vitest";
+import { cleanup, findings, NEXT_SUPABASE, only, project } from "./helpers.ts";
+
+afterAll(cleanup);
+
+const migration = (sql: string) => project({ ...NEXT_SUPABASE, "supabase/migrations/001.sql": sql });
+
+describe("rls-disabled", () => {
+  it("flags a public table until a later migration enables RLS", () => {
+    expect(only(findings(migration("create table todos (id int);")), "rls-disabled")).toHaveLength(1);
+    const later = project({
+      ...NEXT_SUPABASE,
+      "supabase/migrations/001.sql": "create table public.todos (id int);",
+      "supabase/migrations/002.sql": 'ALTER TABLE "public"."todos" ENABLE ROW LEVEL SECURITY;',
+    });
+    expect(only(findings(later), "rls-disabled")).toEqual([]);
+  });
+
+  it("ignores other schemas, dropped tables, SQL in comments and function bodies", () => {
+    const sql = `
+      -- create table public.commented (id int);
+      create table private.secrets (id int);
+      create table public.tmp (id int);
+      drop table public.tmp;
+      create function f() returns void language plpgsql as $$ begin create table public.inner_t (id int); end $$;
+    `;
+    expect(only(findings(migration(sql)), "rls-disabled")).toEqual([]);
+  });
+
+  it("follows a rename", () => {
+    const sql = "create table public.a (id int); alter table public.a rename to b; alter table public.b enable row level security;";
+    expect(only(findings(migration(sql)), "rls-disabled")).toEqual([]);
+  });
+
+  it("skips projects that don't use Supabase (plain Postgres isn't exposed to browsers)", () => {
+    const dir = project({ "package.json": JSON.stringify({ dependencies: { next: "16.0.0", "drizzle-orm": "1.0.0" } }), "drizzle/0001.sql": "create table users (id int);" });
+    expect(findings(dir)).toEqual([]);
+  });
+});
+
+describe("rls-permissive-policy", () => {
+  const base = "create table public.t (id int, user_id uuid); alter table public.t enable row level security;\n";
+
+  it("is an error on writes and a warning on reads", () => {
+    const list = only(
+      findings(migration(base + "create policy w on public.t for update to authenticated using (true);\ncreate policy r on public.t for select using (true);")),
+      "rls-permissive-policy",
+    );
+    expect(list.map((f) => `${f.severity} ${f.line}`)).toEqual(["error 2", "warning 3"]);
+    expect(list[0]!.message).toContain("any signed-in user");
+    expect(list[1]!.message).toContain("anyone (signed in or not)");
+  });
+
+  it("accepts ownership checks, service_role-only policies and dropped policies", () => {
+    const sql =
+      base +
+      "create policy own on public.t for all to authenticated using ((select auth.uid()) = user_id) with check ((select auth.uid()) = user_id);\n" +
+      "create policy svc on public.t for all to service_role using (true);\n" +
+      'create policy "open" on public.t for insert with check (true);\ndrop policy "open" on public.t;';
+    expect(only(findings(migration(sql)), "rls-permissive-policy")).toEqual([]);
+  });
+
+  it("honours a vibe-preflight-ignore comment on the line above", () => {
+    const sql = base + "-- vibe-preflight-ignore rls-permissive-policy (public catalogue)\ncreate policy r on public.t for select using (true);";
+    expect(only(findings(migration(sql)), "rls-permissive-policy")).toEqual([]);
+  });
+});
+
+describe("server-secret-in-client", () => {
+  it("flags a 'use client' file, not a route handler or a comment", () => {
+    const dir = project({
+      ...NEXT_SUPABASE,
+      "components/a.tsx": '"use client";\nconst k = process.env.SUPABASE_SERVICE_ROLE_KEY;\n',
+      "components/b.tsx": '"use client";\n// never use SUPABASE_SERVICE_ROLE_KEY here\n',
+      "app/api/admin/route.ts": "const k = process.env.SUPABASE_SERVICE_ROLE_KEY;\n",
+    });
+    expect(only(findings(dir), "server-secret-in-client").map((f) => `${f.file}:${f.line}`)).toEqual(["components/a.tsx:2"]);
+  });
+
+  it("treats everything under src/ as browser code in a Vite app, except Edge Functions", () => {
+    const dir = project({
+      "package.json": JSON.stringify({ dependencies: { vite: "7.0.0", "@supabase/supabase-js": "2.80.0" } }),
+      "src/lib/admin.ts": "createClient(url, import.meta.env.VITE_SUPABASE_SERVICE_ROLE_KEY);\n",
+      "src/lib/role.ts": "const role = 'service_role';\n",
+      "supabase/functions/admin/index.ts": "Deno.env.get('SUPABASE_SERVICE_ROLE_KEY');\n",
+    });
+    const list = findings(dir);
+    expect(only(list, "server-secret-in-client").map((f) => f.file)).toEqual(["src/lib/admin.ts", "src/lib/role.ts"]);
+    expect(only(list, "public-env-secret").map((f) => f.message)).toEqual(["`VITE_SUPABASE_SERVICE_ROLE_KEY` looks like a secret and is exposed to the browser."]);
+  });
+});
+
+describe("public-env-secret", () => {
+  it("lets browser-safe names through and warns on generic API keys", () => {
+    const dir = project({
+      ...NEXT_SUPABASE,
+      ".env.example": "NEXT_PUBLIC_SUPABASE_ANON_KEY=\nNEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY=\nNEXT_PUBLIC_SITE_URL=\nNEXT_PUBLIC_RESEND_API_KEY=\nNEXT_PUBLIC_DATABASE_URL=\n",
+    });
+    expect(only(findings(dir), "public-env-secret").map((f) => `${f.severity} ${f.line}`)).toEqual(["error 5", "warning 4"]);
+  });
+
+  it("only checks the prefixes of the detected framework", () => {
+    const dir = project({ ...NEXT_SUPABASE, ".env.example": "VITE_STRIPE_SECRET_KEY=\n" });
+    expect(only(findings(dir), "public-env-secret")).toEqual([]);
+  });
+});
+
+describe("stripe-webhook-unverified", () => {
+  const handler = (body: string) =>
+    `export async function POST(req: Request) {\n${body}\n  if (event.type === "checkout.session.completed") {}\n  return new Response("ok");\n}\n`;
+
+  it("flags a handler without constructEvent", () => {
+    const dir = project({ ...NEXT_SUPABASE, "app/api/stripe/webhook/route.ts": handler("  const event = await req.json();") });
+    expect(only(findings(dir), "stripe-webhook-unverified").map((f) => f.line)).toEqual([3]);
+  });
+
+  it("accepts constructEvent and constructEventAsync, but not one in a comment", () => {
+    const sync = handler("  const event = stripe.webhooks.constructEvent(await req.text(), sig, secret);");
+    const edge = handler("  const event = await stripe.webhooks.constructEventAsync(body, sig, secret);");
+    const commented = handler("  // TODO: stripe.webhooks.constructEvent(body, sig, secret)\n  const event = await req.json();");
+    const dir = project({ ...NEXT_SUPABASE, "app/api/stripe/webhook/route.ts": sync, "supabase/functions/stripe/index.ts": edge, "app/api/billing/webhook/route.ts": commented });
+    expect(only(findings(dir), "stripe-webhook-unverified").map((f) => f.file)).toEqual(["app/api/billing/webhook/route.ts"]);
+  });
+
+  it("leaves other providers' webhooks alone", () => {
+    const clerk = 'import { Webhook } from "svix";\nexport async function POST(req: Request) {\n  const event = new Webhook(secret).verify(await req.text(), headers);\n  if (event.type === "user.created") {}\n}\n';
+    const dir = project({ ...NEXT_SUPABASE, "app/api/webhooks/clerk/route.ts": clerk });
+    expect(only(findings(dir), "stripe-webhook-unverified")).toEqual([]);
+  });
+
+  it("ignores client code that only names an event", () => {
+    const dir = project({ ...NEXT_SUPABASE, "components/plan.tsx": '"use client";\nimport { loadStripe } from "@stripe/stripe-js";\nconst e = "checkout.session.completed";\nexport default function P() { return null; }\n' });
+    expect(only(findings(dir), "stripe-webhook-unverified")).toEqual([]);
+  });
+});
+
+describe("env-file-committed (no git repo)", () => {
+  it("flags a root .env with values that .gitignore doesn't cover", () => {
+    const dir = project({ "package.json": "{}", ".gitignore": "node_modules\n", ".env": "KEY=value\n", ".env.example": "KEY=placeholder\n", ".env.test": "\n" });
+    expect(only(findings(dir), "env-file-committed").map((f) => f.message)).toEqual(["`.env` is not in .gitignore, so `git add .` will commit it."]);
+  });
+
+  it("respects negation and reports a missing .gitignore", () => {
+    expect(only(findings(project({ "package.json": "{}", ".gitignore": ".env*\n!.env.local\n", ".env.local": "A=1\n" })), "env-file-committed")).toHaveLength(1);
+    expect(only(findings(project({ "package.json": "{}", ".env": "A=1\n" })), "env-file-committed")[0]!.message).toContain("no .gitignore");
+  });
+});
