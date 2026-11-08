@@ -1,4 +1,4 @@
-import type { Project, Rule, SourceFile } from "../types.ts";
+import type { Finding, Project, Rule, SourceFile } from "../types.ts";
 import { isClientFile, isTestFile } from "../context.ts";
 import { lineAt, stripJsComments } from "../text.ts";
 
@@ -40,5 +40,44 @@ export const webhookUnverified: Rule = {
           line: m ? lineAt(f.text, m.index) : 1,
         };
       });
+  },
+};
+
+const CONSTRUCT_EVENT = /\bconstructEvent(?:Async)?\s*\(\s*/g;
+const PARSED_JSON = /\b(?:req|request|c\.req|ctx\.request)\.json\s*\(/;
+const JSON_BODY_PARSER = /\b(?:express|bodyParser)\.json\s*\(/;
+const RAW_BODY_PARSER = /\b(?:express|bodyParser)\.raw\s*\(/;
+
+export const webhookParsedBody: Rule = {
+  id: "stripe-webhook-parsed-body",
+  severity: "warning",
+  title: "Stripe signature checked against a parsed body",
+  why: "Stripe signs the exact bytes it sent. A body that was parsed and serialized again never matches, so every real event fails with 400, and the usual quick fix people reach for is deleting the check.",
+  fix: "Pass the raw body to `constructEvent`: `await request.text()` in route handlers and edge functions, `express.raw({ type: 'application/json' })` on the webhook route before any `express.json()`, and `export const config = { api: { bodyParser: false } }` plus a raw buffer in a Next.js pages/api route.",
+  check(project) {
+    const jsonParserApp = project.files.some((f) => f.kind === "source" && JSON_BODY_PARSER.test(stripJsComments(f.text)));
+    const rawParserApp = project.files.some((f) => f.kind === "source" && RAW_BODY_PARSER.test(stripJsComments(f.text)));
+    const out: Finding[] = [];
+    for (const f of stripeWebhookFiles(project)) {
+      const code = stripJsComments(f.text);
+      const add = (offset: number, message: string) =>
+        out.push({ rule: this.id, severity: this.severity, message, file: f.path, line: lineAt(f.text, offset) });
+      const calls = [...code.matchAll(CONSTRUCT_EVENT)];
+      if (!calls.length) continue;
+      const json = PARSED_JSON.exec(code);
+      if (json) add(json.index, "Reads the webhook body with `.json()` and then checks the signature, which needs the raw text.");
+      for (const call of calls) {
+        const arg = code.slice(call.index + call[0].length);
+        const at = call.index;
+        if (/^JSON\.stringify\s*\(/.test(arg)) add(at, "`constructEvent` gets `JSON.stringify(...)` of a parsed body, so the signature never matches.");
+        else if (/^req\.body\b(?!\s*\.)/.test(arg)) {
+          if (/(^|\/)pages\/api\//.test(f.path) && !/\bbodyParser\s*:\s*false\b/.test(code))
+            add(at, "`req.body` in a pages/api route is already parsed JSON unless the route sets `bodyParser: false`.");
+          else if (jsonParserApp && !rawParserApp)
+            add(at, "`req.body` comes from `express.json()` and no `express.raw()` is set up, so it isn't the raw body.");
+        }
+      }
+    }
+    return out;
   },
 };

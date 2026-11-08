@@ -1,5 +1,5 @@
 import { afterAll, describe, expect, it } from "vitest";
-import { cleanup, findings, NEXT_SUPABASE, only, project } from "./helpers.ts";
+import { at, cleanup, findings, ids, NEXT_SUPABASE, only, project } from "./helpers.ts";
 
 afterAll(cleanup);
 
@@ -147,6 +147,51 @@ describe("stripe-webhook-unverified", () => {
   it("ignores client code that only names an event", () => {
     const dir = project({ ...NEXT_SUPABASE, "components/plan.tsx": '"use client";\nimport { loadStripe } from "@stripe/stripe-js";\nconst e = "checkout.session.completed";\nexport default function P() { return null; }\n' });
     expect(only(findings(dir), "stripe-webhook-unverified")).toEqual([]);
+  });
+});
+
+describe("stripe-webhook-parsed-body", () => {
+  const verified = (read: string, arg: string) =>
+    `import Stripe from "stripe";\nexport async function POST(req: Request) {\n${read}\n  const event = stripe.webhooks.constructEvent(${arg}, req.headers.get("stripe-signature")!, secret);\n  if (event.type === "checkout.session.completed") {}\n}\n`;
+
+  it("flags .json() and JSON.stringify before constructEvent", () => {
+    const json = verified("  const payload = await req.json();", "JSON.stringify(payload)");
+    const dir = project({ ...NEXT_SUPABASE, "app/api/stripe/webhook/route.ts": json });
+    expect(at(only(findings(dir), "stripe-webhook-parsed-body"))).toEqual([
+      "stripe-webhook-parsed-body warning app/api/stripe/webhook/route.ts:3",
+      "stripe-webhook-parsed-body warning app/api/stripe/webhook/route.ts:4",
+    ]);
+  });
+
+  it("accepts the raw text body", () => {
+    const dir = project({ ...NEXT_SUPABASE, "app/api/stripe/webhook/route.ts": verified("  const body = await req.text();", "body") });
+    expect(only(findings(dir), "stripe-webhook-parsed-body")).toEqual([]);
+  });
+
+  it("flags req.body in pages/api unless bodyParser is off", () => {
+    const handler = (extra: string) =>
+      `import Stripe from "stripe";\n${extra}export default async function handler(req, res) {\n  const event = stripe.webhooks.constructEvent(req.body, req.headers["stripe-signature"], secret);\n}\n`;
+    const dir = project({
+      ...NEXT_SUPABASE,
+      "pages/api/stripe/webhook.ts": handler(""),
+      "pages/api/stripe/webhook-raw.ts": handler("export const config = { api: { bodyParser: false } };\n"),
+    });
+    expect(only(findings(dir), "stripe-webhook-parsed-body").map((f) => f.file)).toEqual(["pages/api/stripe/webhook.ts"]);
+  });
+
+  it("flags req.body in Express only when the app parses JSON and never sets up express.raw()", () => {
+    const route = 'import Stripe from "stripe";\nexport function webhook(req, res) {\n  const event = stripe.webhooks.constructEvent(req.body, req.headers["stripe-signature"], secret);\n}\n';
+    const server = (parsers: string) => `import express from "express";\nconst app = express();\n${parsers}\n`;
+    const pkg = { "package.json": '{"dependencies":{"express":"5.0.0","stripe":"19.0.0"}}' };
+    const broken = project({ ...pkg, "src/server.ts": server("app.use(express.json());"), "src/stripe/webhook.ts": route });
+    const fixed = project({ ...pkg, "src/server.ts": server('app.post("/webhook", express.raw({ type: "application/json" }), webhook);\napp.use(express.json());'), "src/stripe/webhook.ts": route });
+    expect(only(findings(broken), "stripe-webhook-parsed-body").map((f) => f.line)).toEqual([3]);
+    expect(only(findings(fixed), "stripe-webhook-parsed-body")).toEqual([]);
+  });
+
+  it("leaves handlers without constructEvent to stripe-webhook-unverified", () => {
+    const dir = project({ ...NEXT_SUPABASE, "app/api/stripe/webhook/route.ts": 'export async function POST(req: Request) {\n  const event = await req.json();\n  if (event.type === "checkout.session.completed") {}\n}\n' });
+    expect(ids(findings(dir).filter((f) => f.rule.startsWith("stripe-")))).toEqual(["stripe-webhook-unverified"]);
   });
 });
 

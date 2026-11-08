@@ -1,6 +1,6 @@
 ---
 name: vibe-preflight
-description: Pre-launch security scan for Supabase + Stripe apps (Next.js, Vite, Expo; Lovable, Bolt, Cursor and Claude Code builds). Finds public tables without Row Level Security, `using (true)` policies, user-editable plan/role columns, views and SECURITY DEFINER functions that skip RLS, `auth.users` exposed through a view, public storage buckets, the service_role key in browser code, secrets in NEXT_PUBLIC_/VITE_/EXPO_PUBLIC_ variables, Stripe webhooks that skip signature checks, and .env files in git. Use before deploying, before making a repo public, when reviewing a vibe-coded or AI-generated app, or when the user asks "is my Supabase/Stripe app safe to launch?".
+description: Pre-launch security scan for Supabase + Stripe apps (Next.js, Vite, Expo; Lovable, Bolt, Cursor and Claude Code builds). Finds public tables without Row Level Security, `using (true)` policies, user-editable plan/role columns, views and SECURITY DEFINER functions that skip RLS, `auth.users` exposed through a view, public storage buckets, the service_role key in browser code, secrets in NEXT_PUBLIC_/VITE_/EXPO_PUBLIC_ variables, Stripe webhooks that skip signature checks or check them against a parsed body, and .env files in git. Use before deploying, before making a repo public, when reviewing a vibe-coded or AI-generated app, or when the user asks "is my Supabase/Stripe app safe to launch?".
 license: MIT
 ---
 
@@ -8,7 +8,7 @@ license: MIT
 
 A zero-dependency Node 20+ scanner ships in `scripts/preflight.mjs` next to this file. It reads the project's
 files and asks `git` which of them are tracked. It doesn't run the app, install anything or use the network.
-It reports 13 problems that keep
+It reports 14 problems that keep
 showing up in apps built quickly with AI tools.
 
 ## When to run it
@@ -32,7 +32,7 @@ folder instead, e.g. `.agents/skills/vibe-preflight` or `.claude/skills/vibe-pre
 
 Use `--format json` when you will read the result yourself, plain text (`--explain` adds why + fix) when you
 show it to the user. Exit code: `0` no errors, `1` errors found, `2` bad arguments. Other flags:
-`--fail-on warning|never`, `--skip <rule,rule>`, `--list`.
+`--fail-on warning|never`, `--only database|secrets|stripe|<rule>`, `--skip <rule,rule>`, `--list`.
 
 JSON shape: `{ summary: { error, warning }, findings: [{ rule, severity, message, file, line }] }`.
 
@@ -153,6 +153,14 @@ try {
 In Supabase Edge Functions (Deno) use
 `await stripe.webhooks.constructEventAsync(body, signature, secret, undefined, Stripe.createSubtleCryptoProvider())`.
 
+### `stripe-webhook-parsed-body` (warning)
+The handler verifies the signature, but against a body that was already parsed (`req.json()`,
+`JSON.stringify(...)`, `req.body` from `express.json()` or a pages/api route with the default body parser).
+Stripe signs the exact bytes it sent, so every real event fails. Use `await request.text()`; in Express
+register the route with `express.raw({ type: "application/json" })` before `express.json()`; in pages/api
+set `export const config = { api: { bodyParser: false } }` and read the raw request. For a deeper webhook
+review (replay, idempotency, event order) use the `stripe-webhook-security` skill if it's installed.
+
 ### `env-file-committed` (error)
 An env file with values is tracked by git, or git doesn't ignore it. Add `.env*` and `!.env.example` to
 `.gitignore`; for a tracked file run `git rm --cached <file>` and commit. Removing it does not remove it
@@ -160,7 +168,7 @@ from history, so every key in it must be rotated. Don't rewrite git history your
 
 ## Limits (tell the user when it matters)
 
-- Static checks only, 13 of them. A clean run doesn't mean the app is secure: auth flows, rate limits,
+- Static checks only, 14 of them. A clean run doesn't mean the app is secure: auth flows, rate limits,
   business logic and what happens inside function bodies are out of scope.
 - RLS checks read `.sql` files (Supabase migrations, `schema.sql`). Policies created only in the dashboard
   are invisible; suggest `supabase db pull` to get them into migrations.

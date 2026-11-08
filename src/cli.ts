@@ -5,9 +5,9 @@ import { SEVERITY_ORDER } from "./types.ts";
 import { isDirectory } from "./project.ts";
 import { counts, scan } from "./scan.ts";
 import { json, ruleList, text, VERSION } from "./report.ts";
-import { allRules } from "./rules/index.ts";
+import { allRules, ruleGroups } from "./rules/index.ts";
 
-const HELP = `vibe-preflight ${VERSION}: 13 pre-launch security checks for Supabase + Stripe apps (Next.js, Vite, Expo)
+const HELP = `vibe-preflight ${VERSION}: 14 pre-launch security checks for Supabase + Stripe apps (Next.js, Vite, Expo)
 
 Usage
   node preflight.mjs [dir]              scan a project (default: current directory)
@@ -17,6 +17,7 @@ Options
   -f, --format <text|json>              output format (default: text)
   -e, --explain                         text output: add why each finding matters and how to fix it
       --fail-on <error|warning|never>   exit 1 when a finding at this level or above exists (default: error)
+      --only <group|rule,...>           run only these checks; groups: database, secrets, stripe
       --skip <rule,rule>                turn checks off for this run
       --no-color                        plain text (NO_COLOR is respected too)
   -h, --help / -v, --version
@@ -37,6 +38,7 @@ function run(argv: string[]): number {
         format: { type: "string", short: "f", default: "text" },
         explain: { type: "boolean", short: "e", default: false },
         "fail-on": { type: "string", default: "error" },
+        only: { type: "string" },
         skip: { type: "string" },
         "no-color": { type: "boolean", default: false },
         list: { type: "boolean", default: false },
@@ -62,9 +64,17 @@ function run(argv: string[]): number {
   if (format !== "text" && format !== "json") throw new UsageError(`--format must be text or json (got "${format}")`);
   const failOn = values["fail-on"];
   if (failOn !== "error" && failOn !== "warning" && failOn !== "never") throw new UsageError(`--fail-on must be error, warning or never (got "${failOn}")`);
-  const skip = values.skip?.split(",").map((s) => s.trim()).filter(Boolean) ?? [];
+  const list = (v: string | undefined) => v?.split(",").map((s) => s.trim()).filter(Boolean) ?? [];
   const known = new Set(allRules.map((r) => r.id));
+  const skip = list(values.skip);
   for (const id of skip) if (!known.has(id)) throw new UsageError(`unknown check "${id}" in --skip (see --list)`);
+  const only = new Set<string>();
+  for (const name of list(values.only)) {
+    const ids = ruleGroups[name] ?? (known.has(name) ? [name] : undefined);
+    if (!ids) throw new UsageError(`unknown group or check "${name}" in --only (groups: ${Object.keys(ruleGroups).join(", ")}; checks: --list)`);
+    for (const id of ids) only.add(id);
+  }
+  if (only.size) for (const id of known) if (!only.has(id) && !skip.includes(id)) skip.push(id);
 
   const result = scan(dir, skip);
   const color = !values["no-color"] && !process.env.NO_COLOR && process.stdout.isTTY === true;

@@ -865,6 +865,42 @@ var webhookUnverified = {
     });
   }
 };
+var CONSTRUCT_EVENT = /\bconstructEvent(?:Async)?\s*\(\s*/g;
+var PARSED_JSON = /\b(?:req|request|c\.req|ctx\.request)\.json\s*\(/;
+var JSON_BODY_PARSER = /\b(?:express|bodyParser)\.json\s*\(/;
+var RAW_BODY_PARSER = /\b(?:express|bodyParser)\.raw\s*\(/;
+var webhookParsedBody = {
+  id: "stripe-webhook-parsed-body",
+  severity: "warning",
+  title: "Stripe signature checked against a parsed body",
+  why: "Stripe signs the exact bytes it sent. A body that was parsed and serialized again never matches, so every real event fails with 400, and the usual quick fix people reach for is deleting the check.",
+  fix: "Pass the raw body to `constructEvent`: `await request.text()` in route handlers and edge functions, `express.raw({ type: 'application/json' })` on the webhook route before any `express.json()`, and `export const config = { api: { bodyParser: false } }` plus a raw buffer in a Next.js pages/api route.",
+  check(project) {
+    const jsonParserApp = project.files.some((f) => f.kind === "source" && JSON_BODY_PARSER.test(stripJsComments(f.text)));
+    const rawParserApp = project.files.some((f) => f.kind === "source" && RAW_BODY_PARSER.test(stripJsComments(f.text)));
+    const out = [];
+    for (const f of stripeWebhookFiles(project)) {
+      const code = stripJsComments(f.text);
+      const add = (offset, message) => out.push({ rule: this.id, severity: this.severity, message, file: f.path, line: lineAt(f.text, offset) });
+      const calls = [...code.matchAll(CONSTRUCT_EVENT)];
+      if (!calls.length) continue;
+      const json2 = PARSED_JSON.exec(code);
+      if (json2) add(json2.index, "Reads the webhook body with `.json()` and then checks the signature, which needs the raw text.");
+      for (const call of calls) {
+        const arg = code.slice(call.index + call[0].length);
+        const at = call.index;
+        if (/^JSON\.stringify\s*\(/.test(arg)) add(at, "`constructEvent` gets `JSON.stringify(...)` of a parsed body, so the signature never matches.");
+        else if (/^req\.body\b(?!\s*\.)/.test(arg)) {
+          if (/(^|\/)pages\/api\//.test(f.path) && !/\bbodyParser\s*:\s*false\b/.test(code))
+            add(at, "`req.body` in a pages/api route is already parsed JSON unless the route sets `bodyParser: false`.");
+          else if (jsonParserApp && !rawParserApp)
+            add(at, "`req.body` comes from `express.json()` and no `express.raw()` is set up, so it isn't the raw body.");
+        }
+      }
+    }
+    return out;
+  }
+};
 
 // src/rules/index.ts
 var allRules = [
@@ -880,8 +916,14 @@ var allRules = [
   serverSecretInClient,
   publicEnvSecret,
   webhookUnverified,
+  webhookParsedBody,
   envFileCommitted
 ];
+var ruleGroups = {
+  database: [rlsDisabled, rlsPermissivePolicy, rlsNoPolicy, rlsUpdatePrivilegedColumn, viewBypassesRls, authUsersExposed, definerSearchPath, definerFunctionAnon, storagePublicBucket].map((r) => r.id),
+  secrets: [serverSecretInClient, publicEnvSecret, envFileCommitted].map((r) => r.id),
+  stripe: [webhookUnverified, webhookParsedBody].map((r) => r.id)
+};
 
 // src/scan.ts
 var IGNORE = /vibe-preflight-ignore\b([\w\s,-]*)/;
@@ -919,7 +961,7 @@ function counts(findings) {
 }
 
 // src/report.ts
-var VERSION = "1.2.0";
+var VERSION = "1.3.0";
 var plural = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
 function summary(r) {
   const c = counts(r.findings);
@@ -971,7 +1013,7 @@ function ruleList() {
 }
 
 // src/cli.ts
-var HELP = `vibe-preflight ${VERSION}: 13 pre-launch security checks for Supabase + Stripe apps (Next.js, Vite, Expo)
+var HELP = `vibe-preflight ${VERSION}: 14 pre-launch security checks for Supabase + Stripe apps (Next.js, Vite, Expo)
 
 Usage
   node preflight.mjs [dir]              scan a project (default: current directory)
@@ -981,6 +1023,7 @@ Options
   -f, --format <text|json>              output format (default: text)
   -e, --explain                         text output: add why each finding matters and how to fix it
       --fail-on <error|warning|never>   exit 1 when a finding at this level or above exists (default: error)
+      --only <group|rule,...>           run only these checks; groups: database, secrets, stripe
       --skip <rule,rule>                turn checks off for this run
       --no-color                        plain text (NO_COLOR is respected too)
   -h, --help / -v, --version
@@ -1000,6 +1043,7 @@ function run(argv) {
         format: { type: "string", short: "f", default: "text" },
         explain: { type: "boolean", short: "e", default: false },
         "fail-on": { type: "string", default: "error" },
+        only: { type: "string" },
         skip: { type: "string" },
         "no-color": { type: "boolean", default: false },
         list: { type: "boolean", default: false },
@@ -1024,9 +1068,19 @@ function run(argv) {
   if (format !== "text" && format !== "json") throw new UsageError(`--format must be text or json (got "${format}")`);
   const failOn = values["fail-on"];
   if (failOn !== "error" && failOn !== "warning" && failOn !== "never") throw new UsageError(`--fail-on must be error, warning or never (got "${failOn}")`);
-  const skip = values.skip?.split(",").map((s) => s.trim()).filter(Boolean) ?? [];
+  const list2 = (v) => v?.split(",").map((s) => s.trim()).filter(Boolean) ?? [];
   const known = new Set(allRules.map((r) => r.id));
+  const skip = list2(values.skip);
   for (const id of skip) if (!known.has(id)) throw new UsageError(`unknown check "${id}" in --skip (see --list)`);
+  const only = /* @__PURE__ */ new Set();
+  for (const name of list2(values.only)) {
+    const ids = ruleGroups[name] ?? (known.has(name) ? [name] : void 0);
+    if (!ids) throw new UsageError(`unknown group or check "${name}" in --only (groups: ${Object.keys(ruleGroups).join(", ")}; checks: --list)`);
+    for (const id of ids) only.add(id);
+  }
+  if (only.size) {
+    for (const id of known) if (!only.has(id) && !skip.includes(id)) skip.push(id);
+  }
   const result = scan(dir, skip);
   const color = !values["no-color"] && !process.env.NO_COLOR && process.stdout.isTTY === true;
   process.stdout.write(format === "json" ? json(result) : text(result, color, values.explain));

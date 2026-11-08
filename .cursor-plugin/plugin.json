@@ -1,7 +1,7 @@
 {
   "name": "vibe-preflight",
-  "description": "13 pre-launch security checks for Supabase + Stripe apps, with a zero-dependency Node scanner and fix steps for each finding.",
-  "version": "1.2.0",
+  "description": "14 pre-launch security checks for Supabase + Stripe apps (full scan, Supabase RLS audit, Stripe webhook review), with a zero-dependency Node scanner and fix steps, plus an Upwork proposal linter.",
+  "version": "1.3.0",
   "author": {
     "name": "Sunnatulla"
   },

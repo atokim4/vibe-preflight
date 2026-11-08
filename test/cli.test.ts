@@ -42,6 +42,22 @@ describe("preflight.mjs", () => {
     expect(report.findings[0]).toEqual(expect.objectContaining({ rule: "env-file-committed", file: ".env.local", line: 1 }));
   });
 
+  it("runs one group or check with --only, and rejects unknown names", () => {
+    const rules = (...args: string[]) => JSON.parse(run(broken, "--format", "json", ...args).out).rules as string[];
+    expect(rules("--only", "stripe")).toEqual(["stripe-webhook-unverified", "stripe-webhook-parsed-body"]);
+    expect(rules("--only", "database")).toHaveLength(9);
+    expect(rules("--only", "database,env-file-committed", "--skip", "rls-no-policy")).toHaveLength(9);
+    const bad = run(broken, "--only", "billing");
+    expect(bad.code).toBe(2);
+    expect(bad.err).toContain("unknown group or check");
+  });
+
+  it("ships the same scanner in every skill that runs it", () => {
+    const bundle = readFileSync(SCRIPT, "utf8");
+    for (const skill of ["supabase-rls-audit", "stripe-webhook-security"])
+      expect(readFileSync(join(ROOT, "skills", skill, "scripts/preflight.mjs"), "utf8")).toBe(bundle);
+  });
+
   it("explains each rule once with --explain", () => {
     const r = run(broken, "--explain");
     expect(r.out.match(/^rls-permissive-policy: /gm)).toHaveLength(1);
@@ -52,7 +68,7 @@ describe("preflight.mjs", () => {
     expect(run(broken, "--fail-on", "never").code).toBe(0);
     const skipped = run(broken, "--format", "json", "--skip", "rls-disabled,env-file-committed");
     expect(JSON.parse(skipped.out).findings.map((f: { rule: string }) => f.rule)).not.toContain("rls-disabled");
-    expect(JSON.parse(skipped.out).rules).toHaveLength(11);
+    expect(JSON.parse(skipped.out).rules).toHaveLength(12);
   });
 
   it("exits 2 with a message on bad input", () => {
@@ -63,9 +79,9 @@ describe("preflight.mjs", () => {
     }
   });
 
-  it("lists the 13 checks", () => {
+  it("lists the 14 checks", () => {
     const r = run("--list");
     expect(r.code).toBe(0);
-    expect(r.out.trim().split("\n")).toHaveLength(13);
+    expect(r.out.trim().split("\n")).toHaveLength(14);
   });
 });
