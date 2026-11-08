@@ -7,7 +7,7 @@ import { counts, scan } from "./scan.ts";
 import { json, ruleList, text, VERSION } from "./report.ts";
 import { allRules } from "./rules/index.ts";
 
-const HELP = `vibe-preflight ${VERSION}: 6 pre-launch security checks for Supabase + Stripe apps (Next.js, Vite, Expo)
+const HELP = `vibe-preflight ${VERSION}: 13 pre-launch security checks for Supabase + Stripe apps (Next.js, Vite, Expo)
 
 Usage
   node preflight.mjs [dir]              scan a project (default: current directory)

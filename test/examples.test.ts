@@ -7,7 +7,7 @@ const broken = findings(example("broken-app"));
 const fixed = findings(example("fixed-app"));
 
 describe("examples/broken-app", () => {
-  it("trips all six checks", () => {
+  it("trips the six app-level checks", () => {
     expect(ids(broken)).toEqual([
       "env-file-committed",
       "public-env-secret",

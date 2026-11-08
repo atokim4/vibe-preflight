@@ -1,12 +1,12 @@
 {
   "name": "atokim4-vibe-preflight",
-  "description": "Six pre-launch security checks for Supabase + Stripe apps, with a zero-dependency Node scanner and fix steps for each finding.",
+  "description": "13 pre-launch security checks for Supabase + Stripe apps, with a zero-dependency Node scanner and fix steps for each finding.",
   "owner": { "name": "Sunnatulla" },
   "plugins": [
     {
       "name": "vibe-preflight",
       "source": "./",
-      "description": "Six pre-launch security checks for Supabase + Stripe apps, with a zero-dependency Node scanner and fix steps for each finding."
+      "description": "13 pre-launch security checks for Supabase + Stripe apps, with a zero-dependency Node scanner and fix steps for each finding."
     }
   ]
 }

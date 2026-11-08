@@ -1,14 +1,14 @@
 # vibe-preflight
 
-An Agent Skill for Claude Code, Codex and other coding agents that checks a Supabase + Stripe app for six
+An Agent Skill for Claude Code, Codex and other coding agents that checks a Supabase + Stripe app for 13
 common launch blockers before you deploy it. It ships with a small Node scanner (one file, no dependencies)
 that the agent runs, and instructions telling the agent how to read each finding and fix it.
 
 ![vibe-preflight output on the sample broken app](media/output.png)
 
 I built this as a personal project. The checks cover mistakes that are common in Next.js and Vite apps
-generated with AI tools: RLS left off, template policies, the service role key in the browser, and Stripe
-webhooks that trust any POST.
+generated with AI tools: RLS left off, template policies, views and functions that skip RLS, public buckets,
+the service role key in the browser, and Stripe webhooks that trust any POST.
 
 ## Install
 
@@ -32,12 +32,19 @@ node .claude/skills/vibe-preflight/scripts/preflight.mjs path/to/app
 
 (the folder depends on the agent you installed the skill for).
 
-## The six checks
+## The 13 checks
 
 | Check | Severity | What it finds |
 |---|---|---|
 | `rls-disabled` | error | A table in `public` created in a migration with no `enable row level security` anywhere later |
 | `rls-permissive-policy` | error on write, warning on read | `using (true)` / `with check (true)` policies |
+| `rls-no-policy` | warning | RLS on and no policies: the API gets nothing, so a browser read silently returns no rows |
+| `rls-update-privileged-column` | warning | An update policy for users on a table with a `plan`, `role`, `is_admin`, `credits`-style column, and no column privilege or `before update` trigger guarding it |
+| `view-bypasses-rls` | error | A view in `public` without `security_invoker = true` (or any materialized view there) that the API can still read |
+| `auth-users-exposed` | error | A view in `public` that selects from `auth.users` |
+| `definer-search-path` | warning | A `security definer` function with no `set search_path` |
+| `definer-function-anon` | error / warning | A `security definer` function in `public` that anon can call at `/rest/v1/rpc/…`. Error for an explicit grant, warning when Supabase's default grant was never revoked |
+| `storage-public-bucket` | error / warning | A public storage bucket. Error when a `storage.objects` select policy that isn't scoped to the user also lets anyone list it |
 | `server-secret-in-client` | error | `SUPABASE_SERVICE_ROLE_KEY`, `'service_role'` or a Stripe secret in browser code (`"use client"` files in Next.js, `src/` in Vite/Expo) |
 | `public-env-secret` | error / warning | Secret-looking names behind `NEXT_PUBLIC_`, `VITE_` or `EXPO_PUBLIC_` (boolean flags such as `NEXT_PUBLIC_AUTH_PASSWORD=true` are skipped) |
 | `stripe-webhook-unverified` | error | A webhook handler that acts on Stripe events without `constructEvent` / `constructEventAsync` |
@@ -63,20 +70,24 @@ have checked, put `vibe-preflight-ignore <rule-id>` in a comment on its line or 
 
 - Walks the project (skipping `node_modules`, build output and files over 1 MB) and detects Next.js, Vite or
   Expo from `package.json`.
-- Replays the `.sql` files in name order (create/alter/drop table, create/drop policy, renames) to get the
-  final RLS state of each table. Comments and `$$` function bodies are ignored. RLS checks only run when the
+- Replays the `.sql` files in name order (tables, columns, policies, views, functions, grants and revokes,
+  triggers, `storage.buckets` inserts and updates) to get the final state of each object. Comments and `$$` function bodies are ignored. RLS checks only run when the
   project uses Supabase.
 - Strips JS/TS comments before matching, so a commented-out `constructEvent` doesn't count.
 - Asks `git ls-files` and `git check-ignore` about env files when the folder is in a git repo, and falls back
   to reading `.gitignore` when it isn't.
 
 It reads files and calls `git`. It doesn't run your app or use the network. It is a static check: a clean
-run doesn't mean an app is secure. Storage policies, auth flows and policies created only in the Supabase
-dashboard are out of its reach.
+run doesn't mean an app is secure. Auth flows, business logic inside function bodies and anything created
+only in the Supabase dashboard are out of its reach.
 
 ## Tested on
 
-- `examples/broken-app` (all six checks fire once it has a `.env.local`, which the tests create) and
+- [supabase-scanner-bench](https://github.com/atokim4/supabase-scanner-bench), a deliberately broken app with
+  12 documented holes that I also run Supabase's splinter, pgrls and kelp on. Version 1.1.2 caught 5 of 12.
+  The seven database checks added in 1.2.0 came out of that run, so on that bench the 1.2.0 numbers are
+  not a fair comparison with the other tools.
+- `examples/broken-app` (the six app-level checks fire once it has a `.env.local`, which the tests create) and
   `examples/fixed-app` (clean). Both are small made-up fixtures with placeholder values.
 - Two public Supabase + Stripe starters, `vercel/nextjs-subscription-payments` and
   `KolbySisk/next-supabase-stripe-starter`: no errors. Each gets warnings for the public read policies on
@@ -84,14 +95,18 @@ dashboard are out of its reach.
 - `makerkit/next-supabase-saas-kit-lite`: version 1.0.0 reported 7 errors there and all 7 were false
   positives (boolean `NEXT_PUBLIC_*PASSWORD*` flags, and committed env files holding only the Supabase local
   demo keys). 1.1.0 reports them as 3 warnings, and a test keeps real keys in such files an error.
+- The 1.2.0 database checks on those three starters and `Razikus/supabase-nextjs-template` gave warnings only:
+  `customers` tables with RLS on and no policies (server-only by design), `handle_new_user()` trigger
+  functions without `search_path`, and a public avatar bucket. Each is accurate; whether it matters is your call.
 
-## Want more than six checks?
+## The paid kit
 
 vibe-preflight is the free part of a bigger kit I sell on Gumroad, the
 [Vibe App Production Kit](https://sunnatulladev.gumroad.com/l/vibe-app-production-kit) ($29). It has a
-21-check scanner (user-editable `plan`/`role` columns, views that skip RLS, `security definer` without
-`search_path`, middleware that blocks the Stripe webhook, and more), plus Claude Code and Cursor rules that
-keep the assistant from writing these bugs in the first place. The six checks here stay free and MIT.
+21-check scanner with checks this one doesn't have (`getSession()` trusted on the server, middleware that
+blocks the Stripe webhook, signatures checked against a parsed body instead of the raw one, the service role client without
+`server-only`, ignored Supabase errors, and more), plus Claude Code and Cursor rules that keep the assistant
+from writing these bugs in the first place. The checks here stay free and MIT.
 
 ## Development
 
@@ -100,10 +115,10 @@ The scanner is written in TypeScript in `src/` and bundled with esbuild into
 
 ```bash
 npm install
-npm run check   # typecheck, build, 31 Vitest tests
+npm run check   # typecheck, build, 51 Vitest tests
 ```
 
-Tests are in `test/`: rule unit tests, the two example apps, git-tracked env files in a temporary repo, and
+Tests are in `test/`: rule unit tests (`rules.test.ts`, `database.test.ts`), the two example apps, git-tracked env files in a temporary repo, and
 the bundled CLI (exit codes, JSON, flags).
 
 ## License

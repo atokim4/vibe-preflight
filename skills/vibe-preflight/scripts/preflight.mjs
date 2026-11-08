@@ -240,16 +240,55 @@ function clause(norm, keyword) {
   const open = norm.indexOf("(", m.index + m[0].length - 1);
   return open === -1 ? void 0 : balanced(norm, open);
 }
-function buildSchema(files) {
-  const tables = /* @__PURE__ */ new Map();
+function splitTopLevel(s) {
+  const parts = [];
+  let depth = 0;
+  let quote = null;
+  let start = 0;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (quote) {
+      if (c === quote) quote = null;
+    } else if (c === "'" || c === '"') quote = c;
+    else if (c === "(") depth++;
+    else if (c === ")") depth--;
+    else if (c === "," && depth === 0) {
+      parts.push(s.slice(start, i).trim());
+      start = i + 1;
+    }
+  }
+  parts.push(s.slice(start).trim());
+  return parts.filter(Boolean);
+}
+var TABLE_CONSTRAINT = /^(?:constraint|primary key|unique|check|foreign key|exclude|like)\b/;
+var unquote = (s) => s.replace(/^"|"$/g, "");
+function columnsOf(body) {
+  return splitTopLevel(body).filter((part) => !TABLE_CONSTRAINT.test(part)).map((part) => unquote(/^("[^"]+"|[a-z_][a-z0-9_$]*)/.exec(part)?.[1] ?? "")).filter(Boolean);
+}
+var roleList = (raw) => raw.replace(/\b(?:granted by .*|cascade|restrict|with grant option)$/, "").split(",").map((r) => unquote(r.trim())).filter(Boolean);
+var API_ROLES = ["public", "anon", "authenticated"];
+function buildDatabase(files) {
+  const db = { tables: /* @__PURE__ */ new Map(), views: /* @__PURE__ */ new Map(), functions: /* @__PURE__ */ new Map(), buckets: /* @__PURE__ */ new Map(), storagePolicies: [] };
+  const { tables, views, functions, buckets } = db;
   const sorted = [...files].sort((a, b) => a.path.localeCompare(b.path));
+  const defaultRevoked = /* @__PURE__ */ new Set();
   for (const file of sorted) {
     for (const st of splitSql(file)) {
       const s = st.norm;
+      const at = { file: st.file, line: st.line };
       let m;
       if (m = new RegExp(`^create (?:(?:global |local )?(?:temporary |temp )|unlogged )?table (?:if not exists )?(${IDENT})\\s*\\(`).exec(s)) {
         const name = tableName(m[1]);
-        if (!tables.has(name)) tables.set(name, { name, file: st.file, line: st.line, rls: false, policies: [] });
+        if (!tables.has(name))
+          tables.set(name, {
+            name,
+            ...at,
+            rls: false,
+            columns: columnsOf(balanced(s, m.index + m[0].length - 1) ?? ""),
+            policies: [],
+            columnPrivileges: false,
+            beforeUpdateTrigger: false
+          });
         continue;
       }
       if (m = new RegExp(`^drop table (?:if exists )?(${IDENT}(?:\\s*,\\s*${IDENT})*)`).exec(s)) {
@@ -262,6 +301,8 @@ function buildSchema(files) {
         const rest = m[2];
         if (/(?:^|, ?)enable row level security/.test(rest)) t.rls = true;
         if (/(?:^|, ?)disable row level security/.test(rest)) t.rls = false;
+        for (const add of rest.matchAll(/(?:^|, ?)add (?:column )?(?:if not exists )?("[^"]+"|[a-z_][a-z0-9_$]*)/g))
+          if (!TABLE_CONSTRAINT.test(add[1])) t.columns.push(unquote(add[1]));
         const rename = /^rename to "?([a-z_][a-z0-9_]*)"?/.exec(rest);
         if (rename) {
           tables.delete(t.name);
@@ -271,43 +312,155 @@ function buildSchema(files) {
         continue;
       }
       if (m = new RegExp(`^create policy ("[^"]+"|[a-z_][a-z0-9_]*) on (${IDENT})(.*)$`).exec(s)) {
-        const t = tables.get(tableName(m[2]));
-        if (!t) continue;
+        const target = tableName(m[2]);
         const rest = m[3];
         const command = / for (all|select|insert|update|delete)\b/.exec(rest)?.[1] ?? "all";
         const rolesRaw = / to ([a-z_, "]+?)(?= using| with check|$)/.exec(rest)?.[1];
-        t.policies.push({
-          name: m[1].replace(/"/g, ""),
+        const policy = {
+          name: unquote(m[1]),
           command,
-          roles: rolesRaw ? rolesRaw.split(",").map((r) => r.replace(/"/g, "").trim()) : ["public"],
+          roles: rolesRaw ? rolesRaw.split(",").map((r) => unquote(r.trim())) : ["public"],
           using: clause(rest, /\busing\s*\(/),
           withCheck: clause(rest, /\bwith check\s*\(/),
-          file: st.file,
-          line: st.line
-        });
+          ...at
+        };
+        if (target === "storage.objects") db.storagePolicies.push(policy);
+        else tables.get(target)?.policies.push(policy);
         continue;
       }
       if (m = new RegExp(`^drop policy (?:if exists )?("[^"]+"|[a-z_][a-z0-9_]*) on (${IDENT})`).exec(s)) {
-        const t = tables.get(tableName(m[2]));
-        const name = m[1].replace(/"/g, "");
+        const target = tableName(m[2]);
+        const name = unquote(m[1]);
+        if (target === "storage.objects") db.storagePolicies = db.storagePolicies.filter((p) => p.name !== name);
+        const t = tables.get(target);
         if (t) t.policies = t.policies.filter((p) => p.name !== name);
+        continue;
+      }
+      if (m = new RegExp(`^create (?:or replace )?(?:constraint )?trigger \\S+ before (.*?) on (${IDENT})`).exec(s)) {
+        const t = tables.get(tableName(m[2]));
+        if (t && /\bupdate\b/.test(m[1])) t.beforeUpdateTrigger = true;
+        continue;
+      }
+      if (m = new RegExp(`^create (?:or replace )?(?:temp |temporary )?(?:recursive )?(materialized )?view (?:if not exists )?(${IDENT})(.*)$`).exec(s)) {
+        const name = tableName(m[2]);
+        const rest = m[3];
+        const options = clause(rest, /^\s*with\s*\(/) ?? "";
+        views.set(name, {
+          name,
+          ...at,
+          materialized: Boolean(m[1]),
+          securityInvoker: /\bsecurity_invoker\s*(?:=\s*(?:true|on|1|'true'|'on')\s*)?(?:,|$)/.test(options),
+          readsAuthUsers: /\b(?:from|join)\s+"?auth"?\."?users"?(?![a-z0-9_])/.test(rest),
+          revoked: /* @__PURE__ */ new Set()
+        });
+        continue;
+      }
+      if (m = new RegExp(`^alter (?:materialized )?view (?:if exists )?(${IDENT}) set \\((.*)\\)`).exec(s)) {
+        const v = views.get(tableName(m[1]));
+        if (v && /\bsecurity_invoker\s*(?:=\s*(?:true|on|1)\s*)?(?:,|$)/.test(m[2])) v.securityInvoker = true;
+        continue;
+      }
+      if (m = new RegExp(`^drop (?:materialized )?view (?:if exists )?(${IDENT}(?:\\s*,\\s*${IDENT})*)`).exec(s)) {
+        for (const v of m[1].split(",")) views.delete(tableName(v.trim()));
+        continue;
+      }
+      if (m = new RegExp(`^create (?:or replace )?function (${IDENT})\\s*\\(`).exec(s)) {
+        const name = tableName(m[1]);
+        const open = m.index + m[0].length - 1;
+        const args = balanced(s, open) ?? "";
+        const rest = s.slice(open + args.length + 2);
+        functions.set(name, {
+          name,
+          ...at,
+          securityDefiner: /\bsecurity definer\b/.test(rest),
+          searchPath: /\bset search_path\b/.test(rest),
+          returnsTrigger: /^\s*returns (?:trigger|event_trigger)\b/.test(rest),
+          executors: new Set(API_ROLES.filter((r) => !defaultRevoked.has(r)))
+        });
+        continue;
+      }
+      if (m = new RegExp(`^alter function (${IDENT})\\s*(?:\\([^)]*\\))? (.*)$`).exec(s)) {
+        const f = functions.get(tableName(m[1]));
+        if (!f) continue;
+        if (/\bset search_path\b/.test(m[2])) f.searchPath = true;
+        if (/\breset (?:search_path|all)\b/.test(m[2])) f.searchPath = false;
+        if (/\bsecurity definer\b/.test(m[2])) f.securityDefiner = true;
+        if (/\bsecurity invoker\b/.test(m[2])) f.securityDefiner = false;
+        continue;
+      }
+      if (m = new RegExp(`^drop function (?:if exists )?(${IDENT})`).exec(s)) {
+        functions.delete(tableName(m[1]));
+        continue;
+      }
+      if (m = /^alter default privileges (?:for (?:role|user) \S+ )?in schema public revoke execute on functions from (.*)$/.exec(s)) {
+        for (const r of roleList(m[1])) defaultRevoked.add(r);
+        continue;
+      }
+      if (m = new RegExp(`^(grant|revoke) (.+?) on (?:(table|function|routine|procedure) )?(${IDENT})\\s*(?:\\([^)]*\\))? (?:to|from) (.+)$`).exec(s)) {
+        applyPrivilege(db, m[1], m[2], m[3], tableName(m[4]), roleList(m[5]), at);
+        continue;
+      }
+      if (m = /^insert into "?storage"?\."?buckets"? \(([^)]*)\) values (.*)$/.exec(s)) {
+        const cols = splitTopLevel(m[1]).map(unquote);
+        for (const tuple of m[2].replace(/ on conflict\b.*$/, "").matchAll(/\(([^()]*(?:\([^()]*\)[^()]*)*)\)/g)) {
+          const values = splitTopLevel(tuple[1]);
+          const get = (col) => values[cols.indexOf(col)]?.replace(/^'|'$/g, "");
+          const id = get("id") ?? get("name");
+          if (id) buckets.set(id, { id, public: get("public") === "true", ...at });
+        }
+        continue;
+      }
+      if (m = /^update "?storage"?\."?buckets"? set (.*?) where (?:id|name) = '([^']+)'/.exec(s)) {
+        const b = buckets.get(m[2]);
+        const flag = /\bpublic = (true|false)\b/.exec(m[1])?.[1];
+        if (b && flag) {
+          b.public = flag === "true";
+          if (b.public) Object.assign(b, at);
+        }
       }
     }
   }
-  return tables;
+  return db;
+}
+function applyPrivilege(db, action, privileges, objectType, name, roles, at) {
+  if (objectType && objectType !== "table") {
+    const f = db.functions.get(name);
+    if (!f || !/\b(?:execute|all)\b/.test(privileges)) return;
+    for (const r of roles) {
+      if (action === "grant") f.executors.add(r);
+      else f.executors.delete(r);
+    }
+    if (action === "grant" && roles.includes("anon")) f.anonGrant = at;
+    if (action === "revoke" && roles.includes("anon")) f.anonGrant = void 0;
+    return;
+  }
+  const view = db.views.get(name);
+  if (view && /\b(?:select|all)\b/.test(privileges)) {
+    for (const r of roles) {
+      if (action === "revoke") view.revoked.add(r);
+      else view.revoked.delete(r);
+    }
+  }
+  const t = db.tables.get(name);
+  if (!t) return;
+  if (action === "grant" ? /\bupdate\s*\(/.test(privileges) : /\b(?:update|all)\b/.test(privileges)) t.columnPrivileges = true;
 }
 
 // src/rules/database.ts
 var cache = /* @__PURE__ */ new WeakMap();
-function publicTables(project) {
-  let tables = cache.get(project);
-  if (!tables) {
-    const sql = project.usesSupabase ? project.files.filter((f) => f.kind === "sql") : [];
-    tables = [...buildSchema(sql).values()].filter((t) => t.name.startsWith("public."));
-    cache.set(project, tables);
+function database(project) {
+  let db = cache.get(project);
+  if (!db) {
+    db = buildDatabase(project.usesSupabase ? project.files.filter((f) => f.kind === "sql") : []);
+    cache.set(project, db);
   }
-  return tables;
+  return db;
 }
+var inPublic = (name) => name.startsWith("public.");
+var publicTables = (project) => [...database(project).tables.values()].filter((t) => inPublic(t.name));
+var forApiUsers = (p) => p.roles.some((r) => r === "public" || r === "anon" || r === "authenticated");
+var list = (items) => items.length < 2 ? items.join("") : `${items.slice(0, -1).join(", ")} and ${items.at(-1)}`;
+var short = (name) => name.replace(/^public\./, "");
 var isTrue = (expr) => expr !== void 0 && /^\(*\s*true\s*\)*$/.test(expr);
 var rlsDisabled = {
   id: "rls-disabled",
@@ -349,6 +502,143 @@ var rlsPermissivePolicy = {
           line: p.line
         });
       }
+    }
+    return out;
+  }
+};
+var rlsNoPolicy = {
+  id: "rls-no-policy",
+  severity: "warning",
+  title: "Table with RLS on and no policies",
+  why: "RLS with no policies denies every API request. That is right for a server-only table, but if the app reads it with the anon key the query silently returns no rows.",
+  fix: 'If the browser should read it, add the narrowest policy that fits, e.g. `create policy "read flags" on public.<name> for select to anon, authenticated using (true);` for public config. If only the server uses it, keep it as is and mark the table with `-- vibe-preflight-ignore rls-no-policy`.',
+  check(project) {
+    return publicTables(project).filter((t) => t.rls && t.policies.length === 0).map((t) => ({
+      rule: this.id,
+      severity: this.severity,
+      message: `\`${t.name}\` has RLS on and no policies: every API read and write is denied.`,
+      file: t.file,
+      line: t.line
+    }));
+  }
+};
+var PRIVILEGED_COLUMN = /^(?:plan|plan_id|tier|pricing_tier|subscription|subscription_(?:status|tier|plan|id)|stripe_(?:customer|subscription|price)_id|is_?(?:admin|pro|premium|paid|verified|staff|superuser)|admin|premium|role|roles|user_role|credits?|balance|quota|usage_limit)$/;
+var rlsUpdatePrivilegedColumn = {
+  id: "rls-update-privileged-column",
+  severity: "warning",
+  title: "Users can update their own row, including a plan, role or billing column",
+  why: "An update policy decides which rows a user may change, not which columns. If the row holds `plan`, `role` or `is_admin`, a user can call the API with their own key and upgrade themselves.",
+  fix: "Limit the columns: `revoke update on public.<name> from authenticated; grant update (display_name, avatar_url) on public.<name> to authenticated;`. Or move the privileged columns to a table users can't write, or reset them in a `before update` trigger. Change them only from the server (service role) after a verified payment.",
+  check(project) {
+    const out = [];
+    for (const t of publicTables(project)) {
+      if (!t.rls || t.columnPrivileges || t.beforeUpdateTrigger) continue;
+      const columns = t.columns.filter((c) => PRIVILEGED_COLUMN.test(c));
+      if (!columns.length) continue;
+      const policy = t.policies.find((p) => (p.command === "update" || p.command === "all") && forApiUsers(p));
+      if (!policy) continue;
+      out.push({
+        rule: this.id,
+        severity: this.severity,
+        message: `Policy "${policy.name}" lets users update their row in \`${t.name}\`, including ${list(columns.map((c) => `\`${c}\``))}. No column privilege or trigger stops them.`,
+        file: policy.file,
+        line: policy.line
+      });
+    }
+    return out;
+  }
+};
+var apiCanRead = (v) => !(v.revoked.has("anon") && v.revoked.has("authenticated"));
+var viewBypassesRls = {
+  id: "view-bypasses-rls",
+  severity: "error",
+  title: "View in `public` that runs with its owner's rights",
+  why: "A Postgres view runs as the user who created it, and on Supabase that user skips RLS. Unless it is created `with (security_invoker = true)`, the view returns rows from every user even when the table below it is locked down. Materialized views can't apply RLS at all.",
+  fix: "Postgres 15+: `alter view public.<name> set (security_invoker = true);`. For a materialized view, move it to a schema the API doesn't serve, or `revoke select on public.<name> from anon, authenticated;` and read it from the server.",
+  check(project) {
+    return [...database(project).views.values()].filter((v) => inPublic(v.name) && apiCanRead(v) && (v.materialized || !v.securityInvoker)).map((v) => ({
+      rule: this.id,
+      severity: this.severity,
+      message: v.materialized ? `Materialized view \`${v.name}\` is served by the API and RLS doesn't apply to it.` : `View \`${v.name}\` has no \`security_invoker\`, so it reads the tables below it without RLS.`,
+      file: v.file,
+      line: v.line
+    }));
+  }
+};
+var authUsersExposed = {
+  id: "auth-users-exposed",
+  severity: "error",
+  title: "View in `public` that reads `auth.users`",
+  why: "`auth.users` holds every user's email, phone and sign-in metadata. A view over it in `public` puts that on the API for anyone with the anon key (or any signed-in user).",
+  fix: "Keep the fields you want to share (e.g. a display name) in a `public.profiles` table with RLS, filled by a trigger on sign-up. Drop the view, or move it to a private schema and `revoke select on public.<name> from anon, authenticated;`.",
+  check(project) {
+    return [...database(project).views.values()].filter((v) => inPublic(v.name) && v.readsAuthUsers && apiCanRead(v)).map((v) => ({
+      rule: this.id,
+      severity: this.severity,
+      message: `View \`${v.name}\` selects from \`auth.users\` and the API serves it.`,
+      file: v.file,
+      line: v.line
+    }));
+  }
+};
+var definerSearchPath = {
+  id: "definer-search-path",
+  severity: "warning",
+  title: "SECURITY DEFINER function without a fixed `search_path`",
+  why: "A SECURITY DEFINER function runs with its owner's rights. Without a fixed search_path, an unqualified name in its body can resolve to an object the caller controls.",
+  fix: "Add `set search_path = ''` to the function and write every name with its schema (`public.profiles`, `auth.uid()`), or run `alter function public.<name>(<args>) set search_path = '';`.",
+  check(project) {
+    return [...database(project).functions.values()].filter((f) => f.securityDefiner && !f.searchPath).map((f) => ({
+      rule: this.id,
+      severity: this.severity,
+      message: `\`${f.name}()\` is SECURITY DEFINER and doesn't set search_path.`,
+      file: f.file,
+      line: f.line
+    }));
+  }
+};
+var definerFunctionAnon = {
+  id: "definer-function-anon",
+  severity: "error",
+  title: "SECURITY DEFINER function anyone can call over the API",
+  why: "Supabase exposes functions in `public` at /rest/v1/rpc/<name>, and new functions there are executable by anon. A SECURITY DEFINER function skips RLS, so anyone with the anon key gets whatever it does.",
+  fix: "`revoke execute on function public.<name>(<args>) from public, anon;` and grant it only to `authenticated` (and check `auth.uid()` inside), or to `service_role` for admin work. Revoking from `public` alone isn't enough on Supabase: anon has its own grant.",
+  check(project) {
+    return [...database(project).functions.values()].filter((f) => inPublic(f.name) && f.securityDefiner && !f.returnsTrigger && f.executors.has("anon")).map((f) => {
+      const explicit = f.anonGrant !== void 0;
+      const where = f.anonGrant ?? { file: f.file, line: f.line };
+      return {
+        rule: this.id,
+        severity: explicit ? "error" : "warning",
+        message: `\`${f.name}()\` is SECURITY DEFINER and anon can call it at /rest/v1/rpc/${short(f.name)}${explicit ? " (granted explicitly)" : " (Supabase's default grant was never revoked)"}.`,
+        ...where
+      };
+    });
+  }
+};
+var bucketOf = (expr = "") => /\bbucket_id\s*=\s*'([^']+)'/.exec(expr)?.[1];
+var scopedToUser = (expr = "") => /\bauth\.(?:uid|jwt)\s*\(/.test(expr);
+var storagePublicBucket = {
+  id: "storage-public-bucket",
+  severity: "error",
+  title: "Public storage bucket",
+  why: "Every file in a public bucket can be downloaded by anyone who has or guesses its URL, with no auth check. With a select policy on storage.objects that isn't scoped to the user, anyone can also list the bucket and find every file.",
+  fix: "For private files (invoices, uploads, exports): `update storage.buckets set public = false where id = '<bucket>';`, scope select to the owner's folder (`(storage.foldername(name))[1] = (select auth.uid())::text`) and hand out signed URLs from the server. Public buckets are fine for assets meant for everyone (logos, product images); mark those with `-- vibe-preflight-ignore storage-public-bucket`.",
+  check(project) {
+    const db = database(project);
+    const out = [];
+    for (const b of db.buckets.values()) {
+      if (!b.public) continue;
+      const listing = db.storagePolicies.find(
+        (p) => (p.command === "select" || p.command === "all") && forApiUsers(p) && bucketOf(p.using) === b.id && !scopedToUser(p.using)
+      );
+      out.push({
+        rule: this.id,
+        severity: listing ? "error" : "warning",
+        message: listing ? `Storage bucket \`${b.id}\` is public, and policy "${listing.name}" lets anyone list every file in it.` : `Storage bucket \`${b.id}\` is public: anyone with a file's URL can download it.`,
+        file: b.file,
+        line: b.line
+      });
     }
     return out;
   }
@@ -577,7 +867,21 @@ var webhookUnverified = {
 };
 
 // src/rules/index.ts
-var allRules = [rlsDisabled, rlsPermissivePolicy, serverSecretInClient, publicEnvSecret, webhookUnverified, envFileCommitted];
+var allRules = [
+  rlsDisabled,
+  rlsPermissivePolicy,
+  rlsNoPolicy,
+  rlsUpdatePrivilegedColumn,
+  viewBypassesRls,
+  authUsersExposed,
+  definerSearchPath,
+  definerFunctionAnon,
+  storagePublicBucket,
+  serverSecretInClient,
+  publicEnvSecret,
+  webhookUnverified,
+  envFileCommitted
+];
 
 // src/scan.ts
 var IGNORE = /vibe-preflight-ignore\b([\w\s,-]*)/;
@@ -615,7 +919,7 @@ function counts(findings) {
 }
 
 // src/report.ts
-var VERSION = "1.1.2";
+var VERSION = "1.2.0";
 var plural = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
 function summary(r) {
   const c = counts(r.findings);
@@ -667,7 +971,7 @@ function ruleList() {
 }
 
 // src/cli.ts
-var HELP = `vibe-preflight ${VERSION}: 6 pre-launch security checks for Supabase + Stripe apps (Next.js, Vite, Expo)
+var HELP = `vibe-preflight ${VERSION}: 13 pre-launch security checks for Supabase + Stripe apps (Next.js, Vite, Expo)
 
 Usage
   node preflight.mjs [dir]              scan a project (default: current directory)

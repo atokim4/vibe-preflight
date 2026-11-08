@@ -1,6 +1,6 @@
 ---
 name: vibe-preflight
-description: Pre-launch security scan for Supabase + Stripe apps (Next.js, Vite, Expo; Lovable, Bolt, Cursor and Claude Code builds). Finds public tables without Row Level Security, `using (true)` policies, the service_role key in browser code, secrets in NEXT_PUBLIC_/VITE_/EXPO_PUBLIC_ variables, Stripe webhooks that skip signature checks, and .env files in git. Use before deploying, before making a repo public, when reviewing a vibe-coded or AI-generated app, or when the user asks "is my Supabase/Stripe app safe to launch?".
+description: Pre-launch security scan for Supabase + Stripe apps (Next.js, Vite, Expo; Lovable, Bolt, Cursor and Claude Code builds). Finds public tables without Row Level Security, `using (true)` policies, user-editable plan/role columns, views and SECURITY DEFINER functions that skip RLS, `auth.users` exposed through a view, public storage buckets, the service_role key in browser code, secrets in NEXT_PUBLIC_/VITE_/EXPO_PUBLIC_ variables, Stripe webhooks that skip signature checks, and .env files in git. Use before deploying, before making a repo public, when reviewing a vibe-coded or AI-generated app, or when the user asks "is my Supabase/Stripe app safe to launch?".
 license: MIT
 ---
 
@@ -8,7 +8,7 @@ license: MIT
 
 A zero-dependency Node 20+ scanner ships in `scripts/preflight.mjs` next to this file. It reads the project's
 files and asks `git` which of them are tracked. It doesn't run the app, install anything or use the network.
-It reports six problems that keep
+It reports 13 problems that keep
 showing up in apps built quickly with AI tools.
 
 ## When to run it
@@ -70,6 +70,55 @@ a user write other users' rows: replace `true` with an ownership check as above 
 `to authenticated`. On select it shows every row to everyone: fine for a public catalogue or blog, so ask.
 If it is intended, add `-- vibe-preflight-ignore rls-permissive-policy` on the line above the policy.
 
+### `rls-no-policy` (warning)
+RLS is on and the table has no policies, so the API denies every request. Fine for a table only the server
+(service role) touches. If the app reads it from the browser, the query returns an empty list with no
+error: add the narrowest policy that fits, or ignore the finding for a server-only table.
+
+### `rls-update-privileged-column` (warning)
+Users may update their own row, and the row has a column such as `plan`, `role`, `is_admin` or `credits`.
+An RLS policy limits rows, not columns, so a user can send `update profiles set plan = 'pro'` with their own
+key. Limit the writable columns:
+
+```sql
+revoke update on public.profiles from authenticated;
+grant update (display_name, avatar_url) on public.profiles to authenticated;
+```
+
+Or move the column to a table users can't write. Change it only on the server after a verified payment.
+
+### `view-bypasses-rls` (error)
+A view runs as its owner, which on Supabase skips RLS, so a view over a locked-down table returns every
+user's rows. On Postgres 15+ (all current Supabase projects): `alter view public.<name> set (security_invoker = true);`.
+A materialized view can't use RLS: move it out of `public` or revoke select from `anon, authenticated`.
+
+### `auth-users-exposed` (error)
+A view in `public` selects from `auth.users` (emails, phones, sign-in data) and the API serves it. Keep
+shareable fields in `public.profiles` filled by a sign-up trigger, and drop the view or revoke select on it
+from `anon, authenticated`.
+
+### `definer-search-path` (warning)
+A `security definer` function without a fixed `search_path` can resolve unqualified names to objects the
+caller controls. Add `set search_path = ''` and write every name with its schema (`public.profiles`).
+
+### `definer-function-anon` (error / warning)
+A `security definer` function in `public` that anon can call at `/rest/v1/rpc/<name>`. It runs with its
+owner's rights, so anyone with the anon key gets what it does. On Supabase anon has its own EXECUTE grant
+on new functions, so revoking from `public` alone isn't enough:
+
+```sql
+revoke execute on function public.admin_set_plan(uuid, text) from public, anon, authenticated;
+grant execute on function public.admin_set_plan(uuid, text) to service_role;
+```
+
+If signed-in users must call it, grant it to `authenticated` and check `auth.uid()` inside the body.
+
+### `storage-public-bucket` (error / warning)
+Files in a public bucket download for anyone with the URL. It is an error when a select policy on
+`storage.objects` that isn't scoped to the user also lets anyone list the bucket. For private files make the
+bucket private, scope reads to the owner's folder (`(storage.foldername(name))[1] = (select auth.uid())::text`)
+and serve signed URLs. Logos and product images can stay public: ignore the finding with a comment.
+
 ### `server-secret-in-client` (error)
 Browser code uses `SUPABASE_SERVICE_ROLE_KEY` (or the literal `'service_role'`, a Supabase secret key, or a
 Stripe secret). The service role skips all RLS. Browser code means a `"use client"` file in Next.js, and
@@ -111,8 +160,8 @@ from history, so every key in it must be rotated. Don't rewrite git history your
 
 ## Limits (tell the user when it matters)
 
-- Static checks only, six of them. A clean run doesn't mean the app is secure: storage bucket policies,
-  auth flows, rate limits and business logic are out of scope.
+- Static checks only, 13 of them. A clean run doesn't mean the app is secure: auth flows, rate limits,
+  business logic and what happens inside function bodies are out of scope.
 - RLS checks read `.sql` files (Supabase migrations, `schema.sql`). Policies created only in the dashboard
   are invisible; suggest `supabase db pull` to get them into migrations.
 - Silence a confirmed false positive with a `vibe-preflight-ignore <rule-id>` comment on the line or the line

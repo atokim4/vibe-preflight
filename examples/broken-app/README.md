@@ -1,6 +1,6 @@
 # broken-app (sample data)
 
-A tiny, made-up Next.js + Supabase + Stripe notes app with the six mistakes vibe-preflight looks for.
+A tiny, made-up Next.js + Supabase + Stripe notes app with six of the mistakes vibe-preflight looks for (the other database checks have their own tests).
 It is a test fixture, not a working app. All keys and URLs are fake placeholders.
 
 The repo leaves out the app's `.env.local` (committing one is what `env-file-committed` catches). The tests
