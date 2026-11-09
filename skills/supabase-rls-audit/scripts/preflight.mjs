@@ -4,9 +4,6 @@
 import { resolve } from "node:path";
 import { parseArgs } from "node:util";
 
-// src/types.ts
-var SEVERITY_ORDER = { error: 2, warning: 1 };
-
 // src/project.ts
 import { execFileSync } from "node:child_process";
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
@@ -105,6 +102,9 @@ function loadProject(root) {
 function isDirectory(path) {
   return existsSync(path) && statSync(path).isDirectory();
 }
+
+// src/types.ts
+var SEVERITY_ORDER = { error: 2, warning: 1 };
 
 // src/text.ts
 function lineAt(text2, offset) {
@@ -1275,9 +1275,13 @@ function counts(findings) {
   for (const f of findings) c[f.severity]++;
   return c;
 }
+function failsAt(findings, level) {
+  if (!level) return false;
+  return findings.some((f) => SEVERITY_ORDER[f.severity] >= SEVERITY_ORDER[level]);
+}
 
 // src/report.ts
-var VERSION = "1.4.0";
+var VERSION = "1.5.0";
 var plural = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
 function summary(r) {
   const c = counts(r.findings);
@@ -1328,8 +1332,28 @@ function ruleList() {
   return allRules.map((r) => `${r.id.padEnd(28)} ${r.severity.padEnd(8)} ${r.title}`).join("\n") + "\n";
 }
 
+// src/select.ts
+var SelectionError = class extends Error {
+};
+var parseList = (value) => value?.split(/[,\n]/).map((s) => s.trim()).filter(Boolean) ?? [];
+function rulesToSkip(include, exclude) {
+  const known = new Set(allRules.map((r) => r.id));
+  for (const id of exclude) if (!known.has(id)) throw new SelectionError(`unknown check "${id}" (exclude takes check ids; see --list)`);
+  const skip = new Set(exclude);
+  if (include.length) {
+    const wanted = /* @__PURE__ */ new Set();
+    for (const name of include) {
+      const ids = ruleGroups[name] ?? (known.has(name) ? [name] : void 0);
+      if (!ids) throw new SelectionError(`unknown group or check "${name}" (groups: ${Object.keys(ruleGroups).join(", ")}; checks: --list)`);
+      for (const id of ids) wanted.add(id);
+    }
+    for (const id of known) if (!wanted.has(id)) skip.add(id);
+  }
+  return [...skip];
+}
+
 // src/cli.ts
-var HELP = `vibe-preflight ${VERSION}: 14 pre-launch security checks for Supabase + Stripe apps (Next.js, Vite, Expo)
+var HELP = `vibe-preflight ${VERSION}: 17 pre-launch security checks for Supabase + Stripe apps (Next.js, Vite, Expo)
 
 Usage
   node preflight.mjs [dir]              scan a project (default: current directory)
@@ -1384,26 +1408,17 @@ function run(argv) {
   if (format !== "text" && format !== "json") throw new UsageError(`--format must be text or json (got "${format}")`);
   const failOn = values["fail-on"];
   if (failOn !== "error" && failOn !== "warning" && failOn !== "never") throw new UsageError(`--fail-on must be error, warning or never (got "${failOn}")`);
-  const list3 = (v) => v?.split(",").map((s) => s.trim()).filter(Boolean) ?? [];
-  const known = new Set(allRules.map((r) => r.id));
-  const skip = list3(values.skip);
-  for (const id of skip) if (!known.has(id)) throw new UsageError(`unknown check "${id}" in --skip (see --list)`);
-  const only = /* @__PURE__ */ new Set();
-  for (const name of list3(values.only)) {
-    const ids = ruleGroups[name] ?? (known.has(name) ? [name] : void 0);
-    if (!ids) throw new UsageError(`unknown group or check "${name}" in --only (groups: ${Object.keys(ruleGroups).join(", ")}; checks: --list)`);
-    for (const id of ids) only.add(id);
-  }
-  if (only.size) {
-    for (const id of known) if (!only.has(id) && !skip.includes(id)) skip.push(id);
+  let skip;
+  try {
+    skip = rulesToSkip(parseList(values.only), parseList(values.skip));
+  } catch (error) {
+    if (error instanceof SelectionError) throw new UsageError(error.message);
+    throw error;
   }
   const result = scan(dir, skip);
   const color = !values["no-color"] && !process.env.NO_COLOR && process.stdout.isTTY === true;
   process.stdout.write(format === "json" ? json(result) : text(result, color, values.explain));
-  if (failOn === "never") return 0;
-  const c = counts(result.findings);
-  const threshold = SEVERITY_ORDER[failOn];
-  return Object.keys(c).some((s) => SEVERITY_ORDER[s] >= threshold && c[s] > 0) ? 1 : 0;
+  return failsAt(result.findings, failOn === "never" ? void 0 : failOn) ? 1 : 0;
 }
 try {
   process.exitCode = run(process.argv.slice(2));

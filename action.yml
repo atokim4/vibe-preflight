@@ -1,0 +1,44 @@
+name: vibe-preflight
+description: Pre-launch security checks for Supabase + Stripe apps (RLS, Data API grants, leaked keys, webhooks) with SARIF output
+author: Sunnatulla E.
+branding:
+  icon: shield
+  color: green
+
+inputs:
+  path:
+    description: Folder to scan, relative to the repository root.
+    required: false
+    default: .
+  fail-on:
+    description: "Fail the step when a finding at this level or above exists: error, warning or none."
+    required: false
+    default: error
+  format:
+    description: "sarif writes a SARIF 2.1.0 file for code scanning plus the job summary; markdown writes only the job summary."
+    required: false
+    default: sarif
+  include:
+    description: "Run only these checks. Comma- or newline-separated groups (database, secrets, stripe) or check ids. Empty runs all 17."
+    required: false
+    default: ""
+  exclude:
+    description: Comma- or newline-separated check ids to turn off.
+    required: false
+    default: ""
+  sarif-file:
+    description: Where to write the SARIF file, relative to the repository root.
+    required: false
+    default: vibe-preflight.sarif
+
+outputs:
+  findings-count:
+    description: Number of findings (errors + warnings), after inline ignores.
+  errors-count:
+    description: Number of error-level findings.
+  sarif-file:
+    description: Path of the SARIF file, relative to the repository root. Empty when format is markdown.
+
+runs:
+  using: node24
+  main: dist/index.js

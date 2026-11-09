@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.5.0 (2026-11-09)
+
+GitHub Action (`action.yml` at the repo root, `runs.using: node24`, bundled into `dist/index.js` with no
+runtime dependencies):
+
+- Inputs `path`, `fail-on` (`error` | `warning` | `none`), `format` (`sarif` | `markdown`), `include`,
+  `exclude`, `sarif-file`. Outputs `findings-count`, `errors-count`, `sarif-file`.
+- SARIF 2.1.0 for code scanning: every check that ran as a rule with help text (why + fix), `security`
+  tags and a security-severity; each finding with `ruleId`, `ruleIndex`, `level` and a repo-relative
+  file/line location.
+- Job summary with a table of findings (linked to the commit) and the fix for each check that fired.
+- `::error` / `::warning` annotations on the reported lines.
+- `.github/workflows/self-test.yml` runs the unit tests, checks the bundles are current and runs the action
+  on both examples.
+- CLI: `--only` / `--skip` parsing moved to `src/select.ts`, shared with the action. The `--help` header said
+  14 checks; it now says 17.
+
 ## 1.4.0 (2026-11-09)
 
 Supabase stopped granting new `public` tables to the Data API roles on 2026-10-30

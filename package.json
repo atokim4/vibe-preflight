@@ -1,19 +1,21 @@
 {
   "name": "vibe-preflight",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "private": true,
-  "description": "Agent Skill + zero-dependency scanner: 17 pre-launch security checks for Supabase + Stripe apps.",
+  "description": "Agent Skill, GitHub Action and zero-dependency scanner: 17 pre-launch security checks for Supabase + Stripe apps.",
   "type": "module",
   "license": "MIT",
   "engines": {
     "node": ">=20"
   },
   "scripts": {
-    "build": "esbuild src/cli.ts --bundle --platform=node --format=esm --target=node20 --outfile=skills/vibe-preflight/scripts/preflight.mjs --banner:js=\"#!/usr/bin/env node\" && node tools/copy-bundle.mjs",
+    "build": "esbuild src/cli.ts --bundle --platform=node --format=esm --target=node20 --outfile=skills/vibe-preflight/scripts/preflight.mjs --banner:js=\"#!/usr/bin/env node\" && node tools/copy-bundle.mjs && npm run build:action",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "check": "npm run typecheck && npm run build && npm test",
-    "repro:grants": "node examples/grants-repro/repro.ts"
+    "repro:grants": "node examples/grants-repro/repro.ts",
+    "build:action": "esbuild src/action/index.ts --bundle --platform=node --format=esm --target=node20 --outfile=dist/index.js",
+    "action:local": "node tools/run-action-locally.mjs"
   },
   "devDependencies": {
     "@electric-sql/pglite": "0.5.15",

@@ -49,3 +49,9 @@ export function counts(findings: Finding[]): Record<Severity, number> {
   for (const f of findings) c[f.severity]++;
   return c;
 }
+
+/** True when a finding at `level` or above exists. `undefined` means never fail. */
+export function failsAt(findings: Finding[], level: Severity | undefined): boolean {
+  if (!level) return false;
+  return findings.some((f) => SEVERITY_ORDER[f.severity] >= SEVERITY_ORDER[level]);
+}

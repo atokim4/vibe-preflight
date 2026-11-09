@@ -1,13 +1,11 @@
 import { resolve } from "node:path";
 import { parseArgs } from "node:util";
-import type { Severity } from "./types.ts";
-import { SEVERITY_ORDER } from "./types.ts";
 import { isDirectory } from "./project.ts";
-import { counts, scan } from "./scan.ts";
+import { failsAt, scan } from "./scan.ts";
 import { json, ruleList, text, VERSION } from "./report.ts";
-import { allRules, ruleGroups } from "./rules/index.ts";
+import { parseList, rulesToSkip, SelectionError } from "./select.ts";
 
-const HELP = `vibe-preflight ${VERSION}: 14 pre-launch security checks for Supabase + Stripe apps (Next.js, Vite, Expo)
+const HELP = `vibe-preflight ${VERSION}: 17 pre-launch security checks for Supabase + Stripe apps (Next.js, Vite, Expo)
 
 Usage
   node preflight.mjs [dir]              scan a project (default: current directory)
@@ -64,26 +62,19 @@ function run(argv: string[]): number {
   if (format !== "text" && format !== "json") throw new UsageError(`--format must be text or json (got "${format}")`);
   const failOn = values["fail-on"];
   if (failOn !== "error" && failOn !== "warning" && failOn !== "never") throw new UsageError(`--fail-on must be error, warning or never (got "${failOn}")`);
-  const list = (v: string | undefined) => v?.split(",").map((s) => s.trim()).filter(Boolean) ?? [];
-  const known = new Set(allRules.map((r) => r.id));
-  const skip = list(values.skip);
-  for (const id of skip) if (!known.has(id)) throw new UsageError(`unknown check "${id}" in --skip (see --list)`);
-  const only = new Set<string>();
-  for (const name of list(values.only)) {
-    const ids = ruleGroups[name] ?? (known.has(name) ? [name] : undefined);
-    if (!ids) throw new UsageError(`unknown group or check "${name}" in --only (groups: ${Object.keys(ruleGroups).join(", ")}; checks: --list)`);
-    for (const id of ids) only.add(id);
+  let skip: string[];
+  try {
+    skip = rulesToSkip(parseList(values.only), parseList(values.skip));
+  } catch (error) {
+    if (error instanceof SelectionError) throw new UsageError(error.message);
+    throw error;
   }
-  if (only.size) for (const id of known) if (!only.has(id) && !skip.includes(id)) skip.push(id);
 
   const result = scan(dir, skip);
   const color = !values["no-color"] && !process.env.NO_COLOR && process.stdout.isTTY === true;
   process.stdout.write(format === "json" ? json(result) : text(result, color, values.explain));
 
-  if (failOn === "never") return 0;
-  const c = counts(result.findings);
-  const threshold = SEVERITY_ORDER[failOn];
-  return (Object.keys(c) as Severity[]).some((s) => SEVERITY_ORDER[s] >= threshold && c[s] > 0) ? 1 : 0;
+  return failsAt(result.findings, failOn === "never" ? undefined : failOn) ? 1 : 0;
 }
 
 try {

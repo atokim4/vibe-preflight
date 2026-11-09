@@ -1,7 +1,8 @@
 # vibe-preflight
 
 An Agent Skill for Claude Code, Codex and other coding agents that checks a Supabase + Stripe app for 17
-common launch blockers before you deploy it. It ships with a small Node scanner (one file, no dependencies)
+common launch blockers before you deploy it. The same checks also run as a GitHub Action on pull requests
+(see [Use in CI](#use-in-ci)). It ships with a small Node scanner (one file, no dependencies)
 that the agent runs, and instructions telling the agent how to read each finding and fix it.
 
 ![vibe-preflight output on the sample broken app](media/output.png)
@@ -50,6 +51,73 @@ node .claude/skills/vibe-preflight/scripts/preflight.mjs path/to/app
 ```
 
 (the folder depends on the agent you installed the skill for).
+
+## Use in CI
+
+The repo is also a GitHub Action. It runs the same 17 checks, writes a SARIF file that code scanning turns
+into alerts, adds a table of findings with the fix for each check to the job summary, and annotates the
+lines in the pull request diff. Copy this into `.github/workflows/vibe-preflight.yml`:
+
+```yaml
+name: vibe-preflight
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+  security-events: write # upload-sarif needs it
+
+jobs:
+  preflight:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - id: preflight
+        uses: atokim4/vibe-preflight@v1
+        with:
+          fail-on: error
+
+      - uses: github/codeql-action/upload-sarif@v4
+        if: ${{ !cancelled() && steps.preflight.outputs.sarif-file != '' }}
+        with:
+          sarif_file: ${{ steps.preflight.outputs.sarif-file }}
+          category: vibe-preflight
+```
+
+The `v1` tag arrives with the first Marketplace release. Until then, use `atokim4/vibe-preflight@main` or
+pin a commit SHA.
+
+The upload step runs even when the scan fails the job, so the alerts show up for the same commit. Code
+scanning has to be available on the repo for the upload to work: public repos have it, private ones need
+GitHub Code Security. Without it, set `format: markdown` and drop the upload step; you still get the job
+summary, the annotations and the failing check.
+
+| Input | Default | What it does |
+|---|---|---|
+| `path` | `.` | Folder to scan, relative to the repo root. Set it to the app folder in a monorepo |
+| `fail-on` | `error` | `error`, `warning` or `none`. The step fails when a finding at that level or above exists |
+| `format` | `sarif` | `sarif` writes the SARIF file and the job summary, `markdown` only the job summary |
+| `include` | all checks | Groups (`database`, `secrets`, `stripe`) or check ids, comma- or newline-separated |
+| `exclude` | none | Check ids to turn off |
+| `sarif-file` | `vibe-preflight.sarif` | Where the SARIF file goes, relative to the repo root |
+
+| Output | |
+|---|---|
+| `findings-count` | Errors plus warnings, after inline ignores |
+| `errors-count` | Error-level findings only |
+| `sarif-file` | Path of the SARIF file, empty with `format: markdown` |
+
+Each SARIF result has the check id, the level, the file and line, and the check's help text with the fix.
+Errors get a security-severity of 8.0 (shown as High) and warnings 5.0 (Medium). Locations are relative to
+the repo root even when `path` points at a subfolder. GitHub only shows a limited number of annotations per
+step, so on a big first run the job summary and the code scanning tab are where to read the full list.
+
+The action needs no token and makes no network calls. It reads the checked-out files and runs `git
+ls-files`, like the CLI.
 
 ## The 17 checks
 
@@ -166,17 +234,27 @@ Gumroad: [vibe-preflight (free)](https://sunnatulladev.gumroad.com/l/vibe-prefli
 The scanner is written in TypeScript in `src/` and bundled with esbuild into
 `skills/vibe-preflight/scripts/preflight.mjs`, which is committed so the skill works without a build step.
 `npm run build` copies the same file into `supabase-rls-audit` and `stripe-webhook-security`, and a test
-checks the copies match.
+checks the copies match. The GitHub Action (`src/action/`, plus `src/sarif.ts` and `src/summary.ts`) is bundled
+into `dist/index.js` the same way and committed, since a JavaScript action runs straight from the repo.
 
 ```bash
 npm install
-npm run check   # typecheck, build, 93 Vitest tests
+npm run check          # typecheck, build, 113 Vitest tests
+npm run action:local   # run dist/index.js the way a runner does, on examples/broken-app
 npm run repro:grants   # the PGlite grants repro (Node 22.18+)
 ```
 
+`npm run action:local -- examples/fixed-app warning markdown` takes a path, `fail-on` and `format`. It sets the
+`INPUT_*` variables and temporary `$GITHUB_OUTPUT` and `$GITHUB_STEP_SUMMARY` files, then prints what the
+action wrote to them.
+
 Tests are in `test/`: rule unit tests (`rules.test.ts`, `database.test.ts`, `grants.test.ts`), the two example apps, the PGlite
-grants repro (`grants-repro.test.ts`, also checks `OUTPUT.txt` is current), git-tracked env files in a temporary repo, and
-the bundled CLI (exit codes, JSON, flags), the proposal linter copy (`proposal-lint.test.ts`) and the SKILL.md frontmatter of every skill (`skills.test.ts`).
+grants repro (`grants-repro.test.ts`, also checks `OUTPUT.txt` is current), git-tracked env files in a temporary repo,
+the bundled CLI (exit codes, JSON, flags), the SARIF writer (`sarif.test.ts`), the job summary (`summary.test.ts`), the
+bundled action with runner-style inputs (`action.test.ts`), the proposal linter copy (`proposal-lint.test.ts`) and the
+SKILL.md frontmatter of every skill (`skills.test.ts`).
+[`.github/workflows/self-test.yml`](.github/workflows/self-test.yml) runs `npm run check`, checks the committed
+bundles match the source, and runs the action on both examples with the expected counts.
 
 ## License
 

@@ -22,6 +22,7 @@ describe("preflight.mjs", () => {
     const version = read("package.json").version;
     expect(run("--version").out.trim()).toBe(version);
     expect(read(".claude-plugin/plugin.json").version).toBe(version);
+    expect(read(".cursor-plugin/plugin.json").version).toBe(version);
   });
 
   it("exits 1 on errors and 0 on a clean project", () => {
