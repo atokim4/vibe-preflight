@@ -130,6 +130,9 @@ blocks the Stripe webhook, the service role client without
 `server-only`, ignored Supabase errors, and more), plus Claude Code and Cursor rules that keep the assistant
 from writing these bugs in the first place. The checks here stay free and MIT.
 
+If you'd rather not clone the repo, the same skill and scanner are a free download (pay what you want, $0 is fine) on
+Gumroad: [vibe-preflight (free)](https://sunnatulladev.gumroad.com/l/vibe-preflight-free).
+
 ## Development
 
 The scanner is written in TypeScript in `src/` and bundled with esbuild into
