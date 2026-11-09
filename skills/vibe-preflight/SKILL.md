@@ -1,6 +1,6 @@
 ---
 name: vibe-preflight
-description: Pre-launch security scan for Supabase + Stripe apps (Next.js, Vite, Expo; Lovable, Bolt, Cursor and Claude Code builds). Finds public tables without Row Level Security, `using (true)` policies, user-editable plan/role columns, views and SECURITY DEFINER functions that skip RLS, `auth.users` exposed through a view, public storage buckets, the service_role key in browser code, secrets in NEXT_PUBLIC_/VITE_/EXPO_PUBLIC_ variables, Stripe webhooks that skip signature checks or check them against a parsed body, and .env files in git. Use before deploying, before making a repo public, when reviewing a vibe-coded or AI-generated app, or when the user asks "is my Supabase/Stripe app safe to launch?".
+description: Pre-launch security scan for Supabase + Stripe apps (Next.js, Vite, Expo; Lovable, Bolt, Cursor and Claude Code builds). Finds public tables without Row Level Security, `using (true)` policies, user-editable plan/role columns, views and SECURITY DEFINER functions that skip RLS, `auth.users` exposed through a view, public storage buckets, missing or leaking Data API grants after Supabase's 2026-10-30 change (42501 permission denied for table), the service_role key in browser code, secrets in NEXT_PUBLIC_/VITE_/EXPO_PUBLIC_ variables, Stripe webhooks that skip signature checks or check them against a parsed body, and .env files in git. Use before deploying, before making a repo public, when reviewing a vibe-coded or AI-generated app, or when the user asks "is my Supabase/Stripe app safe to launch?".
 license: MIT
 ---
 
@@ -8,7 +8,7 @@ license: MIT
 
 A zero-dependency Node 20+ scanner ships in `scripts/preflight.mjs` next to this file. It reads the project's
 files and asks `git` which of them are tracked. It doesn't run the app, install anything or use the network.
-It reports 14 problems that keep
+It reports 17 problems that keep
 showing up in apps built quickly with AI tools.
 
 ## When to run it
@@ -119,6 +119,22 @@ Files in a public bucket download for anyone with the URL. It is an error when a
 bucket private, scope reads to the owner's folder (`(storage.foldername(name))[1] = (select auth.uid())::text`)
 and serve signed URLs. Logos and product images can stay public: ignore the finding with a comment.
 
+### `grant-leak` (error)
+A grant to anon or authenticated reaches a table with RLS off, or one whose write policy is `true`. This is
+the usual AI answer to a 42501 (`grant all on public.notes to anon`). Undo it with a new migration:
+`revoke all on public.<name> from anon, authenticated;`, enable RLS, add owner policies, then grant only the
+commands the app uses (`grant select, insert on public.<name> to authenticated;`).
+
+### `grants-missing` (warning)
+Since 2026-10-30 Supabase doesn't grant new `public` tables to the Data API roles, so `.from('<table>')` fails
+with 42501 `permission denied for table`. The finding prints the minimal grant for what the code calls
+(`update`/`delete` include `select`, serial columns add the sequence). Grant `anon` only data meant for
+signed-out visitors. If RLS is off, turn it on before granting.
+
+### `grant-broad` (warning)
+`grant … on all tables in schema public to anon, authenticated` or `alter default privileges … grant … on
+tables` opens every table again. Replace it with per-table grants next to each `create table`.
+
 ### `server-secret-in-client` (error)
 Browser code uses `SUPABASE_SERVICE_ROLE_KEY` (or the literal `'service_role'`, a Supabase secret key, or a
 Stripe secret). The service role skips all RLS. Browser code means a `"use client"` file in Next.js, and
@@ -168,7 +184,7 @@ from history, so every key in it must be rotated. Don't rewrite git history your
 
 ## Limits (tell the user when it matters)
 
-- Static checks only, 14 of them. A clean run doesn't mean the app is secure: auth flows, rate limits,
+- Static checks only, 17 of them. A clean run doesn't mean the app is secure: auth flows, rate limits,
   business logic and what happens inside function bodies are out of scope.
 - RLS checks read `.sql` files (Supabase migrations, `schema.sql`). Policies created only in the dashboard
   are invisible; suggest `supabase db pull` to get them into migrations.

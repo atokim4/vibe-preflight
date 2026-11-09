@@ -1,29 +1,54 @@
-import type { Finding, Project, Rule } from "../types.ts";
-import { buildDatabase, type Database, type PolicyInfo, type TableInfo } from "../sql.ts";
+import type { Finding, Project, Rule, SourceFile } from "../types.ts";
+import { autoExposeSetting, buildDatabase, type Database, type PolicyInfo, type TableInfo } from "../sql.ts";
 
 const cache = new WeakMap<Project, Database>();
 
 /**
- * The schema after replaying the migrations. Empty for non-Supabase apps: plain Postgres isn't exposed to
- * browsers, so none of the database checks apply there.
+ * The folder a migration belongs to: everything before its `supabase/` segment. A monorepo can hold several
+ * Supabase projects (an app and a test fixture), and their tables must not mix.
  */
-function database(project: Project): Database {
+export function supabaseRoot(path: string): string {
+  const i = path.startsWith("supabase/") ? 0 : path.indexOf("/supabase/");
+  return i === -1 ? "" : path.slice(0, i === 0 ? 0 : i + 1);
+}
+
+/**
+ * The schema after replaying the migrations, each Supabase project on its own. Empty for non-Supabase apps:
+ * plain Postgres isn't exposed to browsers, so none of the database checks apply there.
+ */
+export function database(project: Project): Database {
   let db = cache.get(project);
-  if (!db) {
-    db = buildDatabase(project.usesSupabase ? project.files.filter((f) => f.kind === "sql") : []);
-    cache.set(project, db);
+  if (db) return db;
+  const groups = new Map<string, SourceFile[]>();
+  if (project.usesSupabase)
+    for (const f of project.files.filter((f) => f.kind === "sql")) {
+      const root = supabaseRoot(f.path);
+      groups.set(root, [...(groups.get(root) ?? []), f]);
+    }
+  db = { tables: new Map(), blanketGrants: [], views: new Map(), functions: new Map(), buckets: new Map(), storagePolicies: [] };
+  for (const [root, files] of groups) {
+    const config = project.byPath.get(`${root}supabase/config.toml`);
+    const part = buildDatabase(files, { autoExposeNewTables: autoExposeSetting(config?.text) });
+    const key = (name: string) => (groups.size > 1 ? `${root}\0${name}` : name);
+    for (const t of part.tables.values()) db.tables.set(key(t.name), { ...t, root });
+    for (const v of part.views.values()) db.views.set(key(v.name), v);
+    for (const f of part.functions.values()) db.functions.set(key(f.name), f);
+    for (const b of part.buckets.values()) db.buckets.set(key(b.id), b);
+    db.blanketGrants.push(...part.blanketGrants);
+    db.storagePolicies.push(...part.storagePolicies);
   }
+  cache.set(project, db);
   return db;
 }
 
 /** Supabase's Data API serves the `public` schema by default. */
 const inPublic = (name: string) => name.startsWith("public.");
-const publicTables = (project: Project): TableInfo[] => [...database(project).tables.values()].filter((t) => inPublic(t.name));
+export const publicTables = (project: Project): TableInfo[] => [...database(project).tables.values()].filter((t) => inPublic(t.name));
 const forApiUsers = (p: PolicyInfo) => p.roles.some((r) => r === "public" || r === "anon" || r === "authenticated");
 const list = (items: string[]) => (items.length < 2 ? items.join("") : `${items.slice(0, -1).join(", ")} and ${items.at(-1)}`);
 const short = (name: string) => name.replace(/^public\./, "");
 
-const isTrue = (expr?: string) => expr !== undefined && /^\(*\s*true\s*\)*$/.test(expr);
+export const isTrue = (expr?: string) => expr !== undefined && /^\(*\s*true\s*\)*$/.test(expr);
 
 export const rlsDisabled: Rule = {
   id: "rls-disabled",

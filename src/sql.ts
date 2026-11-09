@@ -94,11 +94,46 @@ export interface PolicyInfo {
 }
 
 
+/** The table privileges the Data API needs. TRUNCATE, REFERENCES and TRIGGER don't matter to supabase-js. */
+export type TablePrivilege = "select" | "insert" | "update" | "delete";
+export const TABLE_PRIVILEGES: TablePrivilege[] = ["select", "insert", "update", "delete"];
+
+/** The roles PostgREST switches to. */
+export type ApiRole = "anon" | "authenticated" | "service_role";
+export const API_ROLE_NAMES: ApiRole[] = ["anon", "authenticated", "service_role"];
+
+/**
+ * Where a table privilege came from.
+ * - `table`: `grant … on public.t to …`
+ * - `schema`: `grant … on all tables in schema public to …`
+ * - `default`: an `alter default privileges … grant … on tables` that ran before the table was created
+ * - `platform`: Supabase's old automatic grant on new tables (before the 2026-10-30 change)
+ */
+export interface GrantSource {
+  kind: "table" | "schema" | "default" | "platform";
+  file: string;
+  line: number;
+}
+
+/** Why a table got (or didn't get) Supabase's automatic Data API grants when it was created. */
+export type Exposure =
+  | "auto" // created before the change: Supabase granted it to anon, authenticated and service_role
+  | "after-cutoff" // migration dated on or after 2026-10-30
+  | "config-off" // supabase/config.toml sets [api] auto_expose_new_tables = false
+  | "default-privileges"; // an `alter default privileges` in the migrations decided it
+
 export interface TableInfo {
   name: string;
+  /** The folder holding this table's `supabase/` directory ("" for the scan root). Set when projects are grouped. */
+  root?: string;
   file: string;
   line: number;
   rls: boolean;
+  exposure: Exposure;
+  /** Privileges each API role holds after all migrations, with where each one came from. */
+  grants: Map<ApiRole, Map<TablePrivilege, GrantSource>>;
+  /** `serial` / `bigserial` columns: inserts also need USAGE on their sequence. */
+  serialColumns: string[];
   /** Column names from `create table` and later `add column`. */
   columns: string[];
   policies: PolicyInfo[];
@@ -140,8 +175,38 @@ export interface BucketInfo {
   line: number;
 }
 
+/** A grant that covers many tables at once. */
+export interface BlanketGrant {
+  kind: "schema" | "default";
+  file: string;
+  line: number;
+  /** The statement, normalised (lower case, one line). */
+  sql: string;
+  roles: ApiRole[];
+  privileges: TablePrivilege[];
+}
+
+export interface BuildOptions {
+  /** `[api] auto_expose_new_tables` from supabase/config.toml, if set. */
+  autoExposeNewTables?: boolean;
+}
+
+/**
+ * Supabase stopped granting new `public` tables to the Data API roles on all existing projects on this date
+ * (changelog 45329). Migration file names start with a UTC timestamp, so they compare as strings.
+ */
+export const GRANTS_CUTOFF = "20261030000000";
+
+/** `20261102120000_todos.sql` → `20261102120000`. Undefined for names that don't start with a date. */
+export function migrationStamp(path: string): string | undefined {
+  const m = /^((?:19|20)\d{6,12})(?!\d)/.exec(path.slice(path.lastIndexOf("/") + 1));
+  return m ? m[1]!.padEnd(14, "0") : undefined;
+}
+
 export interface Database {
   tables: Map<string, TableInfo>;
+  /** Schema-wide and default-privilege grants to API roles, in migration order. */
+  blanketGrants: BlanketGrant[];
   views: Map<string, ViewInfo>;
   functions: Map<string, FunctionInfo>;
   buckets: Map<string, BucketInfo>;
@@ -198,6 +263,29 @@ function columnsOf(body: string): string[] {
     .filter(Boolean);
 }
 
+function serialColumnsOf(body: string): string[] {
+  return splitTopLevel(body)
+    .map((part) => /^("[^"]+"|[a-z_][a-z0-9_$]*) (?:small|big)?serial\b/.exec(part)?.[1])
+    .filter((c): c is string => Boolean(c))
+    .map(unquote);
+}
+
+/** `select, update (a, b)` → select, update. `all [privileges]` → the four the Data API uses. */
+export function tablePrivileges(raw: string): TablePrivilege[] {
+  const words = raw.replace(/\([^)]*\)/g, " ").split(",").map((w) => w.trim());
+  if (words.some((w) => /^all(?: privileges)?$/.test(w))) return [...TABLE_PRIVILEGES];
+  return TABLE_PRIVILEGES.filter((p) => words.includes(p));
+}
+
+/** API roles a grant names. The PUBLIC pseudo-role reaches every one of them. */
+function apiRoles(roles: string[]): ApiRole[] {
+  if (roles.includes("public")) return [...API_ROLE_NAMES];
+  return API_ROLE_NAMES.filter((r) => roles.includes(r));
+}
+
+const allGranted = (source: GrantSource) =>
+  new Map(API_ROLE_NAMES.map((r) => [r, new Map(TABLE_PRIVILEGES.map((p) => [p, source]))]));
+
 const roleList = (raw: string) =>
   raw
     .replace(/\b(?:granted by .*|cascade|restrict|with grant option)$/, "")
@@ -209,12 +297,25 @@ const roleList = (raw: string) =>
 const API_ROLES = ["public", "anon", "authenticated"];
 
 /** Replay all migrations in file-name order and return the final tables, views, functions and storage buckets. */
-export function buildDatabase(files: SourceFile[]): Database {
-  const db: Database = { tables: new Map(), views: new Map(), functions: new Map(), buckets: new Map(), storagePolicies: [] };
+export function buildDatabase(files: SourceFile[], options: BuildOptions = {}): Database {
+  const db: Database = { tables: new Map(), blanketGrants: [], views: new Map(), functions: new Map(), buckets: new Map(), storagePolicies: [] };
   const { tables, views, functions, buckets } = db;
   const sorted = [...files].sort((a, b) => a.path.localeCompare(b.path));
   /** Roles whose EXECUTE on new public functions was revoked with `alter default privileges`. */
   const defaultRevoked = new Set<string>();
+  /**
+   * Table privileges new `public` tables get, once an `alter default privileges … on tables` has set them.
+   * Undefined until then: the platform default applies.
+   */
+  let tableDefaults: Map<ApiRole, Map<TablePrivilege, GrantSource>> | undefined;
+
+  /** Supabase's own default for a table created in this file. */
+  const platformExposure = (path: string): Exposure => {
+    if (options.autoExposeNewTables === false) return "config-off";
+    const stamp = migrationStamp(path);
+    // The `true` opt-out only ever affected the local CLI; hosted projects ignore it after the cutoff.
+    return stamp !== undefined && stamp >= GRANTS_CUTOFF ? "after-cutoff" : "auto";
+  };
 
   for (const file of sorted) {
     for (const st of splitSql(file)) {
@@ -224,12 +325,27 @@ export function buildDatabase(files: SourceFile[]): Database {
 
       if ((m = new RegExp(`^create (?:(?:global |local )?(?:temporary |temp )|unlogged )?table (?:if not exists )?(${IDENT})\\s*\\(`).exec(s))) {
         const name = tableName(m[1]!);
+        const body = balanced(s, m.index + m[0].length - 1) ?? "";
+        let exposure: Exposure = "auto";
+        let grants = new Map<ApiRole, Map<TablePrivilege, GrantSource>>();
+        if (inPublicSchema(name)) {
+          if (tableDefaults) {
+            exposure = "default-privileges";
+            grants = new Map([...tableDefaults].map(([r, privs]) => [r, new Map(privs)]));
+          } else {
+            exposure = platformExposure(st.file);
+            if (exposure === "auto") grants = allGranted({ kind: "platform", ...at });
+          }
+        }
         if (!tables.has(name))
           tables.set(name, {
             name,
             ...at,
             rls: false,
-            columns: columnsOf(balanced(s, m.index + m[0].length - 1) ?? ""),
+            exposure,
+            grants,
+            serialColumns: serialColumnsOf(body),
+            columns: columnsOf(body),
             policies: [],
             columnPrivileges: false,
             beforeUpdateTrigger: false,
@@ -339,13 +455,47 @@ export function buildDatabase(files: SourceFile[]): Database {
         functions.delete(tableName(m[1]!));
         continue;
       }
+      if ((m = /^alter default privileges (?:for (?:role|user) ("?[a-z_]+"?) )?(?:in schema ("?[a-z_]+"?) )?(grant|revoke) (.+?) on tables (?:to|from) (.+)$/.exec(s))) {
+        const owner = m[1] ? unquote(m[1]) : "postgres";
+        const schema = m[2] ? unquote(m[2]) : "public";
+        // Migrations run as `postgres`; defaults for other creators don't touch the tables they create.
+        if (owner !== "postgres" || schema !== "public") continue;
+        const grant = m[3] === "grant";
+        const privileges = tablePrivileges(m[4]!);
+        const roles = apiRoles(roleList(m[5]!));
+        if (!tableDefaults)
+          tableDefaults = platformExposure(st.file) === "auto" ? allGranted({ kind: "platform", ...at }) : new Map();
+        for (const r of roles) {
+          const held = tableDefaults.get(r) ?? new Map<TablePrivilege, GrantSource>();
+          for (const p of privileges) {
+            if (grant) held.set(p, { kind: "default", ...at });
+            else held.delete(p);
+          }
+          tableDefaults.set(r, held);
+        }
+        if (grant && roles.length && privileges.length)
+          db.blanketGrants.push({ kind: "default", ...at, sql: s, roles, privileges });
+        continue;
+      }
+      if ((m = /^(grant|revoke) (.+?) on all tables in schema (.+?) (?:to|from) (.+)$/.exec(s))) {
+        const schemas = m[3]!.split(",").map((x) => unquote(x.trim()));
+        if (!schemas.includes("public")) continue;
+        const grant = m[1] === "grant";
+        const privileges = tablePrivileges(m[2]!);
+        const roles = apiRoles(roleList(m[4]!));
+        for (const t of tables.values()) if (inPublicSchema(t.name)) setGrants(t, grant, privileges, roles, { kind: "schema", ...at });
+        if (grant && roles.length && privileges.length)
+          db.blanketGrants.push({ kind: "schema", ...at, sql: s, roles, privileges });
+        continue;
+      }
       if ((m = /^alter default privileges (?:for (?:role|user) \S+ )?in schema public revoke execute on functions from (.*)$/.exec(s))) {
         for (const r of roleList(m[1]!)) defaultRevoked.add(r);
         continue;
       }
 
-      if ((m = new RegExp(`^(grant|revoke) (.+?) on (?:(table|function|routine|procedure) )?(${IDENT})\\s*(?:\\([^)]*\\))? (?:to|from) (.+)$`).exec(s))) {
-        applyPrivilege(db, m[1] as "grant" | "revoke", m[2]!, m[3], tableName(m[4]!), roleList(m[5]!), at);
+      if ((m = new RegExp(`^(grant|revoke) (.+?) on (?:(table|function|routine|procedure) )?(${IDENT}(?:\\s*,\\s*${IDENT})*)\\s*(?:\\([^)]*\\))? (?:to|from) (.+)$`).exec(s))) {
+        const names = m[3] && m[3] !== "table" ? [m[4]!] : m[4]!.split(",").map((n) => n.trim());
+        for (const name of names) applyPrivilege(db, m[1] as "grant" | "revoke", m[2]!, m[3], tableName(name), roleList(m[5]!), at);
         continue;
       }
 
@@ -401,6 +551,36 @@ function applyPrivilege(
   }
   const t = db.tables.get(name);
   if (!t) return;
+  setGrants(t, action === "grant", tablePrivileges(privileges), apiRoles(roles), { kind: "table", ...at });
   // A column list on update means "only these columns"; a revoke of update takes the table-wide right away.
   if (action === "grant" ? /\bupdate\s*\(/.test(privileges) : /\b(?:update|all)\b/.test(privileges)) t.columnPrivileges = true;
+}
+
+const inPublicSchema = (name: string) => name.startsWith("public.");
+
+function setGrants(t: TableInfo, grant: boolean, privileges: TablePrivilege[], roles: ApiRole[], source: GrantSource): void {
+  for (const r of roles) {
+    const held = t.grants.get(r) ?? new Map<TablePrivilege, GrantSource>();
+    for (const p of privileges) {
+      if (grant) held.set(p, source);
+      else held.delete(p);
+    }
+    t.grants.set(r, held);
+  }
+}
+
+/** `[api] auto_expose_new_tables = true|false` in supabase/config.toml. Undefined when it isn't set. */
+export function autoExposeSetting(configToml: string | undefined): boolean | undefined {
+  if (!configToml) return undefined;
+  let section = "";
+  for (const raw of configToml.split("\n")) {
+    const line = raw.replace(/#.*$/, "").trim();
+    const header = /^\[([^\]]+)\]$/.exec(line);
+    if (header) section = header[1]!.trim();
+    else if (section === "api") {
+      const m = /^auto_expose_new_tables\s*=\s*(true|false)$/.exec(line);
+      if (m) return m[1] === "true";
+    }
+  }
+  return undefined;
 }

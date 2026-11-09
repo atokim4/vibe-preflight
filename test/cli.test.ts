@@ -27,7 +27,7 @@ describe("preflight.mjs", () => {
   it("exits 1 on errors and 0 on a clean project", () => {
     const bad = run(broken);
     expect(bad.code).toBe(1);
-    expect(bad.out).toContain("6 errors, 2 warnings");
+    expect(bad.out).toContain("6 errors, 4 warnings");
     expect(bad.out).toContain("[stripe-webhook-unverified]");
     const good = run(fixed);
     expect(good.code).toBe(0);
@@ -38,15 +38,15 @@ describe("preflight.mjs", () => {
     const r = run(broken, "--format", "json");
     const report = JSON.parse(r.out);
     expect(report.tool).toBe("vibe-preflight");
-    expect(report.summary).toEqual({ error: 6, warning: 2 });
+    expect(report.summary).toEqual({ error: 6, warning: 4 });
     expect(report.findings[0]).toEqual(expect.objectContaining({ rule: "env-file-committed", file: ".env.local", line: 1 }));
   });
 
   it("runs one group or check with --only, and rejects unknown names", () => {
     const rules = (...args: string[]) => JSON.parse(run(broken, "--format", "json", ...args).out).rules as string[];
     expect(rules("--only", "stripe")).toEqual(["stripe-webhook-unverified", "stripe-webhook-parsed-body"]);
-    expect(rules("--only", "database")).toHaveLength(9);
-    expect(rules("--only", "database,env-file-committed", "--skip", "rls-no-policy")).toHaveLength(9);
+    expect(rules("--only", "database")).toHaveLength(12);
+    expect(rules("--only", "database,env-file-committed", "--skip", "rls-no-policy")).toHaveLength(12);
     const bad = run(broken, "--only", "billing");
     expect(bad.code).toBe(2);
     expect(bad.err).toContain("unknown group or check");
@@ -68,7 +68,7 @@ describe("preflight.mjs", () => {
     expect(run(broken, "--fail-on", "never").code).toBe(0);
     const skipped = run(broken, "--format", "json", "--skip", "rls-disabled,env-file-committed");
     expect(JSON.parse(skipped.out).findings.map((f: { rule: string }) => f.rule)).not.toContain("rls-disabled");
-    expect(JSON.parse(skipped.out).rules).toHaveLength(12);
+    expect(JSON.parse(skipped.out).rules).toHaveLength(15);
   });
 
   it("exits 2 with a message on bad input", () => {
@@ -79,9 +79,9 @@ describe("preflight.mjs", () => {
     }
   });
 
-  it("lists the 14 checks", () => {
+  it("lists the 17 checks", () => {
     const r = run("--list");
     expect(r.code).toBe(0);
-    expect(r.out.trim().split("\n")).toHaveLength(14);
+    expect(r.out.trim().split("\n")).toHaveLength(17);
   });
 });

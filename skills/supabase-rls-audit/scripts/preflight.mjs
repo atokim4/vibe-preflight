@@ -70,6 +70,7 @@ function loadProject(root) {
       else if (entry.name.endsWith(".sql")) kind = "sql";
       else if (ENV_FILE.test(entry.name)) kind = "env";
       else if (entry.name === "package.json" || entry.name === ".gitignore") kind = "other";
+      else if (entry.name === "config.toml" && basename(dir) === "supabase") kind = "other";
       if (!kind || statSync(abs).size > MAX_FILE_BYTES) continue;
       files.push({ path: relative(root, abs).split(sep).join("/"), text: readFileSync(abs, "utf8"), kind });
     }
@@ -226,6 +227,13 @@ function tableName(raw) {
   return parts.length === 1 ? `public.${parts[0]}` : `${parts[0]}.${parts[1]}`;
 }
 var IDENT = String.raw`(?:"[^"]+"|[a-z_][a-z0-9_$]*)(?:\.(?:"[^"]+"|[a-z_][a-z0-9_$]*))?`;
+var TABLE_PRIVILEGES = ["select", "insert", "update", "delete"];
+var API_ROLE_NAMES = ["anon", "authenticated", "service_role"];
+var GRANTS_CUTOFF = "20261030000000";
+function migrationStamp(path) {
+  const m = /^((?:19|20)\d{6,12})(?!\d)/.exec(path.slice(path.lastIndexOf("/") + 1));
+  return m ? m[1].padEnd(14, "0") : void 0;
+}
 function balanced(s, open) {
   let depth = 0;
   for (let i = open; i < s.length; i++) {
@@ -265,13 +273,32 @@ var unquote = (s) => s.replace(/^"|"$/g, "");
 function columnsOf(body) {
   return splitTopLevel(body).filter((part) => !TABLE_CONSTRAINT.test(part)).map((part) => unquote(/^("[^"]+"|[a-z_][a-z0-9_$]*)/.exec(part)?.[1] ?? "")).filter(Boolean);
 }
+function serialColumnsOf(body) {
+  return splitTopLevel(body).map((part) => /^("[^"]+"|[a-z_][a-z0-9_$]*) (?:small|big)?serial\b/.exec(part)?.[1]).filter((c) => Boolean(c)).map(unquote);
+}
+function tablePrivileges(raw) {
+  const words = raw.replace(/\([^)]*\)/g, " ").split(",").map((w) => w.trim());
+  if (words.some((w) => /^all(?: privileges)?$/.test(w))) return [...TABLE_PRIVILEGES];
+  return TABLE_PRIVILEGES.filter((p) => words.includes(p));
+}
+function apiRoles(roles) {
+  if (roles.includes("public")) return [...API_ROLE_NAMES];
+  return API_ROLE_NAMES.filter((r) => roles.includes(r));
+}
+var allGranted = (source) => new Map(API_ROLE_NAMES.map((r) => [r, new Map(TABLE_PRIVILEGES.map((p) => [p, source]))]));
 var roleList = (raw) => raw.replace(/\b(?:granted by .*|cascade|restrict|with grant option)$/, "").split(",").map((r) => unquote(r.trim())).filter(Boolean);
 var API_ROLES = ["public", "anon", "authenticated"];
-function buildDatabase(files) {
-  const db = { tables: /* @__PURE__ */ new Map(), views: /* @__PURE__ */ new Map(), functions: /* @__PURE__ */ new Map(), buckets: /* @__PURE__ */ new Map(), storagePolicies: [] };
+function buildDatabase(files, options = {}) {
+  const db = { tables: /* @__PURE__ */ new Map(), blanketGrants: [], views: /* @__PURE__ */ new Map(), functions: /* @__PURE__ */ new Map(), buckets: /* @__PURE__ */ new Map(), storagePolicies: [] };
   const { tables, views, functions, buckets } = db;
   const sorted = [...files].sort((a, b) => a.path.localeCompare(b.path));
   const defaultRevoked = /* @__PURE__ */ new Set();
+  let tableDefaults;
+  const platformExposure = (path) => {
+    if (options.autoExposeNewTables === false) return "config-off";
+    const stamp = migrationStamp(path);
+    return stamp !== void 0 && stamp >= GRANTS_CUTOFF ? "after-cutoff" : "auto";
+  };
   for (const file of sorted) {
     for (const st of splitSql(file)) {
       const s = st.norm;
@@ -279,12 +306,27 @@ function buildDatabase(files) {
       let m;
       if (m = new RegExp(`^create (?:(?:global |local )?(?:temporary |temp )|unlogged )?table (?:if not exists )?(${IDENT})\\s*\\(`).exec(s)) {
         const name = tableName(m[1]);
+        const body = balanced(s, m.index + m[0].length - 1) ?? "";
+        let exposure = "auto";
+        let grants = /* @__PURE__ */ new Map();
+        if (inPublicSchema(name)) {
+          if (tableDefaults) {
+            exposure = "default-privileges";
+            grants = new Map([...tableDefaults].map(([r, privs]) => [r, new Map(privs)]));
+          } else {
+            exposure = platformExposure(st.file);
+            if (exposure === "auto") grants = allGranted({ kind: "platform", ...at });
+          }
+        }
         if (!tables.has(name))
           tables.set(name, {
             name,
             ...at,
             rls: false,
-            columns: columnsOf(balanced(s, m.index + m[0].length - 1) ?? ""),
+            exposure,
+            grants,
+            serialColumns: serialColumnsOf(body),
+            columns: columnsOf(body),
             policies: [],
             columnPrivileges: false,
             beforeUpdateTrigger: false
@@ -344,12 +386,12 @@ function buildDatabase(files) {
       if (m = new RegExp(`^create (?:or replace )?(?:temp |temporary )?(?:recursive )?(materialized )?view (?:if not exists )?(${IDENT})(.*)$`).exec(s)) {
         const name = tableName(m[2]);
         const rest = m[3];
-        const options = clause(rest, /^\s*with\s*\(/) ?? "";
+        const options2 = clause(rest, /^\s*with\s*\(/) ?? "";
         views.set(name, {
           name,
           ...at,
           materialized: Boolean(m[1]),
-          securityInvoker: /\bsecurity_invoker\s*(?:=\s*(?:true|on|1|'true'|'on')\s*)?(?:,|$)/.test(options),
+          securityInvoker: /\bsecurity_invoker\s*(?:=\s*(?:true|on|1|'true'|'on')\s*)?(?:,|$)/.test(options2),
           readsAuthUsers: /\b(?:from|join)\s+"?auth"?\."?users"?(?![a-z0-9_])/.test(rest),
           revoked: /* @__PURE__ */ new Set()
         });
@@ -392,12 +434,45 @@ function buildDatabase(files) {
         functions.delete(tableName(m[1]));
         continue;
       }
+      if (m = /^alter default privileges (?:for (?:role|user) ("?[a-z_]+"?) )?(?:in schema ("?[a-z_]+"?) )?(grant|revoke) (.+?) on tables (?:to|from) (.+)$/.exec(s)) {
+        const owner = m[1] ? unquote(m[1]) : "postgres";
+        const schema = m[2] ? unquote(m[2]) : "public";
+        if (owner !== "postgres" || schema !== "public") continue;
+        const grant = m[3] === "grant";
+        const privileges = tablePrivileges(m[4]);
+        const roles = apiRoles(roleList(m[5]));
+        if (!tableDefaults)
+          tableDefaults = platformExposure(st.file) === "auto" ? allGranted({ kind: "platform", ...at }) : /* @__PURE__ */ new Map();
+        for (const r of roles) {
+          const held = tableDefaults.get(r) ?? /* @__PURE__ */ new Map();
+          for (const p of privileges) {
+            if (grant) held.set(p, { kind: "default", ...at });
+            else held.delete(p);
+          }
+          tableDefaults.set(r, held);
+        }
+        if (grant && roles.length && privileges.length)
+          db.blanketGrants.push({ kind: "default", ...at, sql: s, roles, privileges });
+        continue;
+      }
+      if (m = /^(grant|revoke) (.+?) on all tables in schema (.+?) (?:to|from) (.+)$/.exec(s)) {
+        const schemas = m[3].split(",").map((x) => unquote(x.trim()));
+        if (!schemas.includes("public")) continue;
+        const grant = m[1] === "grant";
+        const privileges = tablePrivileges(m[2]);
+        const roles = apiRoles(roleList(m[4]));
+        for (const t of tables.values()) if (inPublicSchema(t.name)) setGrants(t, grant, privileges, roles, { kind: "schema", ...at });
+        if (grant && roles.length && privileges.length)
+          db.blanketGrants.push({ kind: "schema", ...at, sql: s, roles, privileges });
+        continue;
+      }
       if (m = /^alter default privileges (?:for (?:role|user) \S+ )?in schema public revoke execute on functions from (.*)$/.exec(s)) {
         for (const r of roleList(m[1])) defaultRevoked.add(r);
         continue;
       }
-      if (m = new RegExp(`^(grant|revoke) (.+?) on (?:(table|function|routine|procedure) )?(${IDENT})\\s*(?:\\([^)]*\\))? (?:to|from) (.+)$`).exec(s)) {
-        applyPrivilege(db, m[1], m[2], m[3], tableName(m[4]), roleList(m[5]), at);
+      if (m = new RegExp(`^(grant|revoke) (.+?) on (?:(table|function|routine|procedure) )?(${IDENT}(?:\\s*,\\s*${IDENT})*)\\s*(?:\\([^)]*\\))? (?:to|from) (.+)$`).exec(s)) {
+        const names = m[3] && m[3] !== "table" ? [m[4]] : m[4].split(",").map((n) => n.trim());
+        for (const name of names) applyPrivilege(db, m[1], m[2], m[3], tableName(name), roleList(m[5]), at);
         continue;
       }
       if (m = /^insert into "?storage"?\."?buckets"? \(([^)]*)\) values (.*)$/.exec(s)) {
@@ -443,17 +518,63 @@ function applyPrivilege(db, action, privileges, objectType, name, roles, at) {
   }
   const t = db.tables.get(name);
   if (!t) return;
+  setGrants(t, action === "grant", tablePrivileges(privileges), apiRoles(roles), { kind: "table", ...at });
   if (action === "grant" ? /\bupdate\s*\(/.test(privileges) : /\b(?:update|all)\b/.test(privileges)) t.columnPrivileges = true;
+}
+var inPublicSchema = (name) => name.startsWith("public.");
+function setGrants(t, grant, privileges, roles, source) {
+  for (const r of roles) {
+    const held = t.grants.get(r) ?? /* @__PURE__ */ new Map();
+    for (const p of privileges) {
+      if (grant) held.set(p, source);
+      else held.delete(p);
+    }
+    t.grants.set(r, held);
+  }
+}
+function autoExposeSetting(configToml) {
+  if (!configToml) return void 0;
+  let section = "";
+  for (const raw of configToml.split("\n")) {
+    const line = raw.replace(/#.*$/, "").trim();
+    const header = /^\[([^\]]+)\]$/.exec(line);
+    if (header) section = header[1].trim();
+    else if (section === "api") {
+      const m = /^auto_expose_new_tables\s*=\s*(true|false)$/.exec(line);
+      if (m) return m[1] === "true";
+    }
+  }
+  return void 0;
 }
 
 // src/rules/database.ts
 var cache = /* @__PURE__ */ new WeakMap();
+function supabaseRoot(path) {
+  const i = path.startsWith("supabase/") ? 0 : path.indexOf("/supabase/");
+  return i === -1 ? "" : path.slice(0, i === 0 ? 0 : i + 1);
+}
 function database(project) {
   let db = cache.get(project);
-  if (!db) {
-    db = buildDatabase(project.usesSupabase ? project.files.filter((f) => f.kind === "sql") : []);
-    cache.set(project, db);
+  if (db) return db;
+  const groups = /* @__PURE__ */ new Map();
+  if (project.usesSupabase)
+    for (const f of project.files.filter((f2) => f2.kind === "sql")) {
+      const root = supabaseRoot(f.path);
+      groups.set(root, [...groups.get(root) ?? [], f]);
+    }
+  db = { tables: /* @__PURE__ */ new Map(), blanketGrants: [], views: /* @__PURE__ */ new Map(), functions: /* @__PURE__ */ new Map(), buckets: /* @__PURE__ */ new Map(), storagePolicies: [] };
+  for (const [root, files] of groups) {
+    const config = project.byPath.get(`${root}supabase/config.toml`);
+    const part = buildDatabase(files, { autoExposeNewTables: autoExposeSetting(config?.text) });
+    const key = (name) => groups.size > 1 ? `${root}\0${name}` : name;
+    for (const t of part.tables.values()) db.tables.set(key(t.name), { ...t, root });
+    for (const v of part.views.values()) db.views.set(key(v.name), v);
+    for (const f of part.functions.values()) db.functions.set(key(f.name), f);
+    for (const b of part.buckets.values()) db.buckets.set(key(b.id), b);
+    db.blanketGrants.push(...part.blanketGrants);
+    db.storagePolicies.push(...part.storagePolicies);
   }
+  cache.set(project, db);
   return db;
 }
 var inPublic = (name) => name.startsWith("public.");
@@ -606,12 +727,12 @@ var definerFunctionAnon = {
   check(project) {
     return [...database(project).functions.values()].filter((f) => inPublic(f.name) && f.securityDefiner && !f.returnsTrigger && f.executors.has("anon")).map((f) => {
       const explicit = f.anonGrant !== void 0;
-      const where = f.anonGrant ?? { file: f.file, line: f.line };
+      const where2 = f.anonGrant ?? { file: f.file, line: f.line };
       return {
         rule: this.id,
         severity: explicit ? "error" : "warning",
         message: `\`${f.name}()\` is SECURITY DEFINER and anon can call it at /rest/v1/rpc/${short(f.name)}${explicit ? " (granted explicitly)" : " (Supabase's default grant was never revoked)"}.`,
-        ...where
+        ...where2
       };
     });
   }
@@ -669,6 +790,198 @@ function publicPrefixes(project) {
   if (project.frameworks.includes("expo")) prefixes.push("EXPO_PUBLIC_");
   return prefixes.length ? prefixes : ["NEXT_PUBLIC_", "VITE_", "EXPO_PUBLIC_"];
 }
+
+// src/usage.ts
+var FROM = /\.\s*from\s*\(\s*(["'`])([A-Za-z_][A-Za-z0-9_]*)\1\s*\)/g;
+var NOT_A_TABLE = /(?:\bstorage|\bArray|\bBuffer|Uint8Array|\bschema\s*\(\s*["'`](?!public["'`])[^)]*\))\s*$/;
+var METHOD = /\.\s*(select|insert|update|upsert|delete)\s*\(/g;
+var SERVICE_KEY = /SERVICE_ROLE|service_role|serviceRole|SUPABASE_SECRET_KEY|sb_secret_/;
+function chainAfter(code, start) {
+  const rest = code.slice(start, start + 800);
+  const end = rest.search(/;|\n\s*\n|\.\s*from\s*\(|\b(?:const|let|var|return|if|for)\s/);
+  return end === -1 ? rest : rest.slice(0, end);
+}
+function privilegesFor(chain) {
+  const needed = /* @__PURE__ */ new Set();
+  for (const m of chain.matchAll(METHOD)) {
+    const method = m[1];
+    if (method === "upsert") ["insert", "update", "select"].forEach((p) => needed.add(p));
+    else needed.add(method);
+    if (method === "update" || method === "delete") needed.add("select");
+  }
+  if (!needed.size) needed.add("select");
+  return [...needed];
+}
+function callsIn(project, file) {
+  const code = stripJsComments(file.text);
+  const client = isClientFile(project, file);
+  const role = !client && SERVICE_KEY.test(code) ? "service_role" : "authenticated";
+  const calls = [];
+  for (const m of code.matchAll(FROM)) {
+    if (NOT_A_TABLE.test(code.slice(Math.max(0, m.index - 40), m.index))) continue;
+    calls.push({
+      table: `public.${m[2]}`,
+      file: file.path,
+      line: lineAt(code, m.index),
+      role,
+      client,
+      privileges: privilegesFor(chainAfter(code, m.index + m[0].length))
+    });
+  }
+  return calls;
+}
+var cache2 = /* @__PURE__ */ new WeakMap();
+function tableCalls(project) {
+  let calls = cache2.get(project);
+  if (!calls) {
+    calls = project.files.filter((f) => f.kind === "source" && !isTestFile(f)).flatMap((f) => callsIn(project, f));
+    cache2.set(project, calls);
+  }
+  return calls;
+}
+
+// src/rules/grants.ts
+var short2 = (name) => name.replace(/^public\./, "");
+var list2 = (items) => items.length < 2 ? items.join("") : `${items.slice(0, -1).join(", ")} and ${items.at(-1)}`;
+var ordered = (privileges) => TABLE_PRIVILEGES.filter((p) => new Set(privileges).has(p));
+var where = (s) => `${s.file}:${s.line}`;
+var appliesTo = (p, role) => p.roles.includes(role) || p.roles.includes("public");
+var coversCommand = (p, privilege) => p.command === privilege || p.command === "all";
+var readsAuth = (expr = "") => /\bauth\.(?:uid|jwt|role)\s*\(/.test(expr);
+function openWritePolicy(t, privilege, role) {
+  if (privilege === "select") return void 0;
+  return t.policies.find((p) => {
+    if (!appliesTo(p, role) || !coversCommand(p, privilege)) return false;
+    const check = p.withCheck ?? p.using;
+    return privilege === "insert" ? isTrue(check) : isTrue(p.using) || privilege === "update" && isTrue(check);
+  });
+}
+function anonNeeds(t, privilege) {
+  return t.rls && t.policies.some(
+    (p) => coversCommand(p, privilege) && (p.roles.includes("anon") || p.roles.includes("public") && !readsAuth(p.using) && !readsAuth(p.withCheck))
+  );
+}
+var WHY_NO_GRANTS = {
+  "after-cutoff": "is created in a migration dated after Supabase's 2026-10-30 change, so it gets no Data API grants",
+  "config-off": "is created with `auto_expose_new_tables = false` in supabase/config.toml, so it gets no Data API grants",
+  "default-privileges": "is created after an `alter default privileges` that stopped the automatic Data API grants",
+  auto: "had its Data API grants revoked"
+};
+var grantsMissing = {
+  id: "grants-missing",
+  severity: "warning",
+  title: "Table the app queries with no Data API grant (Supabase's 2026-10-30 change)",
+  why: "Since 2026-10-30 Supabase no longer grants new `public` tables to anon, authenticated and service_role. RLS policies alone don't help: without a GRANT every supabase-js call fails with 42501 `permission denied for table`.",
+  fix: "Add the smallest grant the code needs in the same migration that creates the table, e.g. `grant select, insert, update, delete on public.<name> to authenticated;`. Grant to anon only what signed-out visitors really use (`grant select on public.<name> to anon;` for public reads). Keep RLS on. Avoid `grant all` and `on all tables in schema public`.",
+  check(project) {
+    const tables = publicTables(project);
+    const roots = [...new Set(tables.map((t) => t.root ?? ""))].sort((a, b) => b.length - a.length);
+    const rootOf = (file) => roots.find((r) => file.startsWith(r)) ?? "";
+    const calls = tableCalls(project).map((c) => ({ ...c, root: rootOf(c.file) }));
+    const out = [];
+    for (const t of tables) {
+      const used = calls.filter((c) => c.table === t.name && c.root === (t.root ?? ""));
+      if (!used.length) continue;
+      const needs = /* @__PURE__ */ new Map();
+      const need = (role, privilege) => needs.set(role, (needs.get(role) ?? /* @__PURE__ */ new Set()).add(privilege));
+      for (const c of used)
+        for (const p of c.privileges) {
+          need(c.role, p);
+          if (c.role === "authenticated" && anonNeeds(t, p)) need("anon", p);
+        }
+      const statements = [];
+      for (const role of API_ROLE_NAMES) {
+        const missing = ordered([...needs.get(role) ?? []].filter((p) => !t.grants.get(role)?.has(p)));
+        if (!missing.length) continue;
+        statements.push(`grant ${missing.join(", ")} on ${t.name} to ${role};`);
+        if (missing.includes("insert"))
+          for (const col of t.serialColumns) statements.push(`grant usage on sequence ${t.name}_${col}_seq to ${role};`);
+      }
+      if (!statements.length) continue;
+      const first = used[0];
+      const call = `.from('${short2(t.name)}') at ${where(first)}${used.length > 1 ? ` and ${used.length - 1} more` : ""}`;
+      out.push({
+        rule: this.id,
+        severity: this.severity,
+        message: `\`${t.name}\` ${WHY_NO_GRANTS[t.exposure]}: supabase-js will 42501 "permission denied for table ${short2(t.name)}" on ${call}. Minimal grant: \`${statements.join(" ")}\`` + (t.rls ? "" : " Enable RLS and add policies first: a grant on a table without RLS opens every row."),
+        file: t.file,
+        line: t.line
+      });
+    }
+    return out;
+  }
+};
+function leaks(tables) {
+  const bySource = /* @__PURE__ */ new Map();
+  for (const t of tables) {
+    for (const role of ["anon", "authenticated"]) {
+      for (const [privilege, source] of t.grants.get(role) ?? []) {
+        if (source.kind === "platform") continue;
+        const policy = t.rls ? openWritePolicy(t, privilege, role) : void 0;
+        if (t.rls && !policy) continue;
+        const key = where(source);
+        const entry = bySource.get(key) ?? { source, roles: /* @__PURE__ */ new Set(), privileges: /* @__PURE__ */ new Set(), tables: /* @__PURE__ */ new Map() };
+        entry.roles.add(role);
+        entry.privileges.add(privilege);
+        if (!policy) entry.tables.set(t.name, null);
+        else entry.tables.set(t.name, (entry.tables.get(t.name) ?? /* @__PURE__ */ new Set()).add(policy));
+        bySource.set(key, entry);
+      }
+    }
+  }
+  return [...bySource.values()];
+}
+var STATEMENT = {
+  table: "This grant",
+  schema: "This `on all tables in schema public` grant",
+  default: "This `alter default privileges` grant",
+  platform: ""
+};
+var grantLeak = {
+  id: "grant-leak",
+  severity: "error",
+  title: "Grant to anon/authenticated on a table RLS doesn't protect",
+  why: "A GRANT opens a table to the Data API and RLS decides which rows each request sees. A grant on a table with RLS off, or with a `using (true)` write policy, lets anyone with the anon key (or any signed-up user) read and rewrite every row. This is the usual AI fix for 42501 errors after Supabase's 2026-10-30 change.",
+  fix: "Turn RLS on (`alter table public.<name> enable row level security;`), replace `true` in write policies with an ownership check like `(select auth.uid()) = user_id`, and grant only the commands the app uses to the role that uses them: `grant select, insert, update, delete on public.<name> to authenticated;`. Revoke the rest: `revoke all on public.<name> from anon;`.",
+  check(project) {
+    return leaks(publicTables(project)).map((e) => {
+      const tables = [...e.tables];
+      const why = (policies) => policies === null ? "RLS is off" : `${policies.size > 1 ? "policies" : "policy"} ${list2([...policies].map((p) => `"${p.name}" (${p.command})`))} ${policies.size > 1 ? "use" : "uses"} \`true\``;
+      const shown = tables.slice(0, 3).map(([name, policies]) => `\`${name}\` (${why(policies)})`);
+      const more = tables.length > 3 ? ` and ${tables.length - 3} more` : "";
+      const who = e.roles.has("anon") ? "anyone with the anon key" : "any signed-in user";
+      const privileges = ordered(e.privileges);
+      const reads = privileges.includes("select");
+      const writes = privileges.some((p) => p !== "select");
+      const harm = tables.some(([, policies]) => policies === null) ? `can ${reads && writes ? "read and change" : reads ? "read" : "change"} every row` : "can write rows that belong to other users";
+      return {
+        rule: this.id,
+        severity: this.severity,
+        message: `${STATEMENT[e.source.kind]} gives ${list2([...e.roles])} ${privileges.join(", ")} on ${list2(shown)}${more}: ${who} ${harm}.`,
+        file: e.source.file,
+        line: e.source.line
+      };
+    });
+  }
+};
+var grantBroad = {
+  id: "grant-broad",
+  severity: "warning",
+  title: "Blanket grant on every table in `public`",
+  why: "`grant \u2026 on all tables in schema public` and `alter default privileges \u2026 grant \u2026 on tables` hand every table to the Data API roles, which undoes Supabase's 2026-10-30 change. Internal tables, queues and audit logs become reachable as soon as their RLS slips.",
+  fix: "Grant per table, next to the `create table`, with only what the app uses: `grant select on public.<name> to anon;` for public reads, `grant select, insert, update, delete on public.<name> to authenticated;` for user data. Server-only tables get `grant \u2026 to service_role` and nothing for anon/authenticated.",
+  check(project) {
+    const db = database(project);
+    const leaking = new Set(leaks(publicTables(project)).map((e) => where(e.source)));
+    return db.blanketGrants.filter((g) => g.roles.some((r) => r !== "service_role") && !leaking.has(where(g))).map((g) => ({
+      rule: this.id,
+      severity: this.severity,
+      message: g.kind === "schema" ? `Grants ${g.privileges.join(", ")} on every table in \`public\` to ${list2(g.roles)}, which undoes Supabase's 2026-10-30 change for all of them. Grant per table instead.` : `Turns automatic grants back on for every future table in \`public\` (${g.privileges.join(", ")} to ${list2(g.roles)}), which undoes Supabase's 2026-10-30 change. Grant per table instead.`,
+      file: g.file,
+      line: g.line
+    }));
+  }
+};
 
 // src/rules/secrets.ts
 var SECRET_NAME = /(SECRET|SERVICE_ROLE|PRIVATE|PASSWORD|PASSWD|DATABASE_URL|DB_URL|POSTGRES_URL|WEBHOOK_SIGNING|_SK$|SIGNING_KEY)/;
@@ -807,12 +1120,12 @@ var envFileCommitted = {
   check(project) {
     const out = [];
     const prefixes = publicPrefixes(project);
-    const push = (f, where) => {
+    const push = (f, where2) => {
       const kind = envValueKind(f.text, prefixes);
       out.push({
         rule: this.id,
         severity: kind === "secret" ? this.severity : "warning",
-        message: `${where}.${ENV_KIND_NOTE[kind]}`,
+        message: `${where2}.${ENV_KIND_NOTE[kind]}`,
         file: f.path,
         line: 1
       });
@@ -913,6 +1226,9 @@ var allRules = [
   definerSearchPath,
   definerFunctionAnon,
   storagePublicBucket,
+  grantLeak,
+  grantsMissing,
+  grantBroad,
   serverSecretInClient,
   publicEnvSecret,
   webhookUnverified,
@@ -920,7 +1236,7 @@ var allRules = [
   envFileCommitted
 ];
 var ruleGroups = {
-  database: [rlsDisabled, rlsPermissivePolicy, rlsNoPolicy, rlsUpdatePrivilegedColumn, viewBypassesRls, authUsersExposed, definerSearchPath, definerFunctionAnon, storagePublicBucket].map((r) => r.id),
+  database: [rlsDisabled, rlsPermissivePolicy, rlsNoPolicy, rlsUpdatePrivilegedColumn, viewBypassesRls, authUsersExposed, definerSearchPath, definerFunctionAnon, storagePublicBucket, grantLeak, grantsMissing, grantBroad].map((r) => r.id),
   secrets: [serverSecretInClient, publicEnvSecret, envFileCommitted].map((r) => r.id),
   stripe: [webhookUnverified, webhookParsedBody].map((r) => r.id)
 };
@@ -961,7 +1277,7 @@ function counts(findings) {
 }
 
 // src/report.ts
-var VERSION = "1.3.0";
+var VERSION = "1.4.0";
 var plural = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
 function summary(r) {
   const c = counts(r.findings);
@@ -1068,12 +1384,12 @@ function run(argv) {
   if (format !== "text" && format !== "json") throw new UsageError(`--format must be text or json (got "${format}")`);
   const failOn = values["fail-on"];
   if (failOn !== "error" && failOn !== "warning" && failOn !== "never") throw new UsageError(`--fail-on must be error, warning or never (got "${failOn}")`);
-  const list2 = (v) => v?.split(",").map((s) => s.trim()).filter(Boolean) ?? [];
+  const list3 = (v) => v?.split(",").map((s) => s.trim()).filter(Boolean) ?? [];
   const known = new Set(allRules.map((r) => r.id));
-  const skip = list2(values.skip);
+  const skip = list3(values.skip);
   for (const id of skip) if (!known.has(id)) throw new UsageError(`unknown check "${id}" in --skip (see --list)`);
   const only = /* @__PURE__ */ new Set();
-  for (const name of list2(values.only)) {
+  for (const name of list3(values.only)) {
     const ids = ruleGroups[name] ?? (known.has(name) ? [name] : void 0);
     if (!ids) throw new UsageError(`unknown group or check "${name}" in --only (groups: ${Object.keys(ruleGroups).join(", ")}; checks: --list)`);
     for (const id of ids) only.add(id);

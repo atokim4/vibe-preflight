@@ -52,6 +52,7 @@ export function loadProject(root: string): Project {
       else if (entry.name.endsWith(".sql")) kind = "sql";
       else if (ENV_FILE.test(entry.name)) kind = "env";
       else if (entry.name === "package.json" || entry.name === ".gitignore") kind = "other";
+      else if (entry.name === "config.toml" && basename(dir) === "supabase") kind = "other";
       if (!kind || statSync(abs).size > MAX_FILE_BYTES) continue;
       files.push({ path: relative(root, abs).split(sep).join("/"), text: readFileSync(abs, "utf8"), kind });
     }

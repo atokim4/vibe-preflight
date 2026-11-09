@@ -1,6 +1,6 @@
 # vibe-preflight
 
-An Agent Skill for Claude Code, Codex and other coding agents that checks a Supabase + Stripe app for 14
+An Agent Skill for Claude Code, Codex and other coding agents that checks a Supabase + Stripe app for 17
 common launch blockers before you deploy it. It ships with a small Node scanner (one file, no dependencies)
 that the agent runs, and instructions telling the agent how to read each finding and fix it.
 
@@ -8,7 +8,8 @@ that the agent runs, and instructions telling the agent how to read each finding
 
 I built this as a personal project. The checks cover mistakes that are common in Next.js and Vite apps
 generated with AI tools: RLS left off, template policies, views and functions that skip RLS, public buckets,
-the service role key in the browser, and Stripe webhooks that trust any POST.
+the service role key in the browser, Stripe webhooks that trust any POST, and the Data API grants that
+Supabase stopped adding to new tables on 2026-10-30.
 
 ## Install
 
@@ -26,8 +27,8 @@ Or as a Claude Code plugin (the repo is its own plugin marketplace):
 The repo holds four skills. `npx skills add atokim4/vibe-preflight` offers all of them; to take just one:
 
 ```bash
-npx skills add atokim4/vibe-preflight --skill vibe-preflight            # all 14 checks
-npx skills add atokim4/vibe-preflight --skill supabase-rls-audit        # the 9 database checks
+npx skills add atokim4/vibe-preflight --skill vibe-preflight            # all 17 checks
+npx skills add atokim4/vibe-preflight --skill supabase-rls-audit        # the 12 database checks
 npx skills add atokim4/vibe-preflight --skill stripe-webhook-security   # the 2 Stripe checks + a review list
 npx skills add atokim4/vibe-preflight --skill upwork-proposal-lint      # proposal linter, unrelated to security
 ```
@@ -35,7 +36,7 @@ npx skills add atokim4/vibe-preflight --skill upwork-proposal-lint      # propos
 | Skill | What it does |
 |---|---|
 | `vibe-preflight` | Runs every check below and fixes what it finds |
-| `supabase-rls-audit` | Runs `--only database`: RLS, policies, views, SECURITY DEFINER functions, storage buckets |
+| `supabase-rls-audit` | Runs `--only database`: RLS, policies, views, SECURITY DEFINER functions, storage buckets, Data API grants |
 | `stripe-webhook-security` | Runs `--only stripe`, then reviews the handler for raw body, replay tolerance, idempotency, event order and the webhook secret (the review part is reading code, not scanning) |
 | `upwork-proposal-lint` | Writes or checks an Upwork proposal with a copy of the linter from [cover-letter-lint](https://github.com/atokim4/cover-letter-lint): AI phrases, dashes, off-platform contact, placeholders, word count, claims not in your facts file |
 
@@ -50,7 +51,7 @@ node .claude/skills/vibe-preflight/scripts/preflight.mjs path/to/app
 
 (the folder depends on the agent you installed the skill for).
 
-## The 14 checks
+## The 17 checks
 
 | Check | Severity | What it finds |
 |---|---|---|
@@ -63,6 +64,9 @@ node .claude/skills/vibe-preflight/scripts/preflight.mjs path/to/app
 | `definer-search-path` | warning | A `security definer` function with no `set search_path` |
 | `definer-function-anon` | error / warning | A `security definer` function in `public` that anon can call at `/rest/v1/rpc/…`. Error for an explicit grant, warning when Supabase's default grant was never revoked |
 | `storage-public-bucket` | error / warning | A public storage bucket. Error when a `storage.objects` select policy that isn't scoped to the user also lets anyone list it |
+| `grant-leak` | error | A grant to anon/authenticated on a table with RLS off or a `true` write policy: `grant all on public.t to anon`, `grant … on all tables in schema public`, or `alter default privileges … grant … on tables` |
+| `grants-missing` | warning | `.from('<table>')` in app code on a table with no grant for the role the code runs as (created after 2026-10-30, `auto_expose_new_tables = false`, or after a default-privileges revoke). supabase-js gets 42501; the message has the minimal grant |
+| `grant-broad` | warning | `grant … on all tables in schema public` or `alter default privileges … grant … on tables` to anon/authenticated, which undoes the 2026-10-30 change for every table |
 | `server-secret-in-client` | error | `SUPABASE_SERVICE_ROLE_KEY`, `'service_role'` or a Stripe secret in browser code (`"use client"` files in Next.js, `src/` in Vite/Expo) |
 | `public-env-secret` | error / warning | Secret-looking names behind `NEXT_PUBLIC_`, `VITE_` or `EXPO_PUBLIC_` (boolean flags such as `NEXT_PUBLIC_AUTH_PASSWORD=true` are skipped) |
 | `stripe-webhook-unverified` | error | A webhook handler that acts on Stripe events without `constructEvent` / `constructEventAsync` |
@@ -70,6 +74,25 @@ node .claude/skills/vibe-preflight/scripts/preflight.mjs path/to/app
 | `env-file-committed` | error / warning | An `.env*` file with values that git tracks or doesn't ignore. Warning only when it holds just the Supabase CLI's local demo keys or just public variables |
 
 `SKILL.md` explains each one with the fix. The scanner also prints the why and the fix with `--explain`.
+
+## Supabase's 2026-10-30 grants change
+
+Since [2026-10-30](https://supabase.com/changelog/45329-breaking-change-tables-not-exposed-to-data-and-graphql-api-automatically)
+new tables in `public` get no grants for `anon`, `authenticated` or `service_role`, so supabase-js returns
+`42501 permission denied for table <name>` until you add one. Older tables keep their grants. The quick fixes
+that circulate (`grant all … to anon`, the bulk `on all tables in schema public` grant) open tables that have
+RLS off to anyone with the anon key.
+
+`grants-missing` dates each table by its migration file name, follows `alter default privileges` in the
+migrations and `[api] auto_expose_new_tables` in `supabase/config.toml`, and works out the grant from what the
+code calls: `.select()` → `select`, `.insert()` → `insert`, `.update()`/`.delete()` → that plus `select`
+(filters read columns), `.upsert()` → `select, insert, update`. Browser and SSR code counts as
+`authenticated`, a client built with the service role key as `service_role`, and `anon` only gets what a
+signed-out policy allows.
+
+[`examples/grants-repro`](examples/grants-repro) replays this in real Postgres (PGlite): the 42501, the fix
+grant taken straight from the finding, and the leak from `grant all` on a table with RLS off. The run is saved
+in [`OUTPUT.txt`](examples/grants-repro/OUTPUT.txt); `npm run repro:grants` prints it again.
 
 ## Options
 
@@ -91,7 +114,8 @@ have checked, put `vibe-preflight-ignore <rule-id>` in a comment on its line or 
 - Walks the project (skipping `node_modules`, build output and files over 1 MB) and detects Next.js, Vite or
   Expo from `package.json`.
 - Replays the `.sql` files in name order (tables, columns, policies, views, functions, grants and revokes,
-  triggers, `storage.buckets` inserts and updates) to get the final state of each object. Comments and `$$` function bodies are ignored. RLS checks only run when the
+  default privileges, triggers, `storage.buckets` inserts and updates) to get the final state of each object.
+  Each `supabase/` folder in a monorepo is replayed on its own. Comments and `$$` function bodies are ignored. RLS checks only run when the
   project uses Supabase.
 - Strips JS/TS comments before matching, so a commented-out `constructEvent` doesn't count.
 - Asks `git ls-files` and `git check-ignore` about env files when the folder is in a git repo, and falls back
@@ -118,6 +142,10 @@ only in the Supabase dashboard are out of its reach.
 - The 1.2.0 database checks on those three starters and `Razikus/supabase-nextjs-template` gave warnings only:
   `customers` tables with RLS on and no policies (server-only by design), `handle_new_user()` trigger
   functions without `search_path`, and a public avatar bucket. Each is accurate; whether it matters is your call.
+- The 1.4.0 grant checks give nothing on the three starters above: their migrations predate 2026-10-30. On
+  `supabase/supabase-js` they flag its test fixtures (a bulk `grant all on all tables in schema public` to anon
+  over tables with RLS off or anon insert/delete policies). That is accurate for the fixtures, which are not
+  meant to be secure.
 - `stripe-webhook-parsed-body` (1.3.0) gives nothing on the two Stripe starters, which read the body with
   `req.text()`. After I changed one of them to `JSON.stringify(await req.json())` it reported that line.
 
@@ -142,10 +170,12 @@ checks the copies match.
 
 ```bash
 npm install
-npm run check   # typecheck, build, 64 Vitest tests
+npm run check   # typecheck, build, 93 Vitest tests
+npm run repro:grants   # the PGlite grants repro (Node 22.18+)
 ```
 
-Tests are in `test/`: rule unit tests (`rules.test.ts`, `database.test.ts`), the two example apps, git-tracked env files in a temporary repo, and
+Tests are in `test/`: rule unit tests (`rules.test.ts`, `database.test.ts`, `grants.test.ts`), the two example apps, the PGlite
+grants repro (`grants-repro.test.ts`, also checks `OUTPUT.txt` is current), git-tracked env files in a temporary repo, and
 the bundled CLI (exit codes, JSON, flags), the proposal linter copy (`proposal-lint.test.ts`) and the SKILL.md frontmatter of every skill (`skills.test.ts`).
 
 ## License

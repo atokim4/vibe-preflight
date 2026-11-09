@@ -1,0 +1,51 @@
+$ vibe-preflight examples/grants-repro/app
+error   rls-disabled  supabase/migrations/20261106090000_notes.sql:2
+        `public.notes` is created without `enable row level security` in any migration.
+error   grant-leak  supabase/migrations/20261107090000_fix_permission_denied.sql:2
+        This grant gives anon and authenticated select, insert, update, delete on `public.notes` (RLS is off): anyone with the anon key can read and change every row.
+warning grants-missing  supabase/migrations/20261105090000_todos.sql:2
+        `public.todos` is created in a migration dated after Supabase's 2026-10-30 change, so it gets no Data API grants: supabase-js will 42501 "permission denied for table todos" on .from('todos') at src/todos.ts:4 and 2 more. Minimal grant: `grant select, insert, update on public.todos to authenticated;`
+
+-- applied supabase-bootstrap.sql + 3 migrations; seeding sample rows as postgres
+
+-- 1. todos: RLS and policies are right, but no grant (created after 2026-10-30)
+alice> select id, title, done from public.todos order by id
+  ERROR 42501: permission denied for table todos
+alice> insert into public.todos (title) values ('alice: new todo')
+  ERROR 42501: permission denied for table todos
+
+-- 2. granting only UPDATE is not enough: the filter (where id = 1) needs SELECT
+postgres> grant update on public.todos to authenticated;
+alice> update public.todos set done = true where id = 1
+  ERROR 42501: permission denied for table todos
+postgres> revoke update on public.todos from authenticated;
+
+-- 3. the grant grants-missing printed, nothing more
+postgres> grant select, insert, update on public.todos to authenticated;
+alice> select id, title, done from public.todos order by id
+  {"id":1,"title":"alice: buy milk","done":false}
+alice> insert into public.todos (title) values ('alice: new todo')
+  ok (1 row)
+alice> update public.todos set done = true where id = 1
+  ok (1 row)
+alice> update public.todos set done = true where id = 2
+  ok (0 rows)
+anon> select id, title from public.todos
+  ERROR 42501: permission denied for table todos
+
+-- 4. notes: RLS off + `grant all on public.notes to anon, authenticated` (the 42501 quick fix)
+anon> select id, user_id, body from public.notes order by id
+  {"id":1,"user_id":"00000000-0000-4000-a000-00000000000a","body":"alice: door code 4821"}
+  {"id":2,"user_id":"00000000-0000-4000-a000-00000000000b","body":"bob: salary 5400"}
+anon> update public.notes set body = 'changed by a stranger' where true
+  ok (2 rows)
+
+-- 5. the grant-leak fix: RLS on, an owner policy, and only the grant the app uses
+postgres> revoke all on public.notes from anon, authenticated;
+alter table public.notes enable row level security;
+create policy "notes: own rows" on public.notes for select to authenticated using ((select auth.uid()) = user_id);
+grant select on public.notes to authenticated;
+anon> select id, user_id, body from public.notes order by id
+  ERROR 42501: permission denied for table notes
+bob> select id, body from public.notes order by id
+  {"id":2,"body":"changed by a stranger"}

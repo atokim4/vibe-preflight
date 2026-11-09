@@ -1,6 +1,6 @@
 ---
 name: supabase-rls-audit
-description: Audit Supabase Row Level Security from the migrations in a repo. Finds public tables without RLS, tables with RLS and no policies, `using (true)` / `with check (true)` policies, update policies that let users change their own plan/role/credits columns, views that skip RLS, views over `auth.users`, SECURITY DEFINER functions without a fixed search_path or callable by anon, and public storage buckets. Use when the user asks to check Supabase RLS or policies, before launching a Supabase app, after writing a migration, or when reviewing a Lovable, Bolt or Cursor build that uses Supabase.
+description: Audit Supabase Row Level Security from the migrations in a repo. Finds public tables without RLS, tables with RLS and no policies, `using (true)` / `with check (true)` policies, update policies that let users change their own plan/role/credits columns, views that skip RLS, views over `auth.users`, SECURITY DEFINER functions without a fixed search_path or callable by anon, public storage buckets, and the Data API grants Supabase stopped adding on 2026-10-30 (tables that fail with 42501 permission denied for table, and grant all or schema-wide grants that open tables RLS doesn't protect). Use when the user hits 42501 or permission denied for table, asks to check Supabase RLS, policies or grants, before launching a Supabase app, after writing a migration, or when reviewing a Lovable, Bolt or Cursor build that uses Supabase.
 license: MIT
 ---
 
@@ -9,7 +9,7 @@ license: MIT
 This skill runs the database part of the vibe-preflight scanner (`scripts/preflight.mjs` next to this file,
 Node 20+, no dependencies, no network). It reads the `.sql` files in the project (Supabase migrations,
 `schema.sql`), replays tables, policies, views, functions, grants and storage buckets in order, and reports
-9 problems. It doesn't connect to a database.
+12 problems. It doesn't connect to a database.
 
 ## Run it
 
@@ -43,6 +43,9 @@ clean from an empty scan.
 | `definer-search-path` | warning | A `security definer` function without `set search_path`. |
 | `definer-function-anon` | error / warning | A `security definer` function in `public` that anon can call at `/rest/v1/rpc/<name>`. Error with an explicit grant to anon, warning for Supabase's default grant. |
 | `storage-public-bucket` | error / warning | A public bucket. Error when a select policy on `storage.objects` also lets anyone list it. |
+| `grant-leak` | error | A grant to anon/authenticated (on the table, `on all tables in schema public`, or through `alter default privileges`) on a table with RLS off or a `true` write policy. Anyone with the anon key reads or rewrites every row. |
+| `grants-missing` | warning | App code calls `.from('<table>')` on a table that has no grant for the role it runs as: created in a migration dated after 2026-10-30, with `auto_expose_new_tables = false` in `supabase/config.toml`, or after an `alter default privileges … revoke`. supabase-js will 42501. The message has the exact grant. |
+| `grant-broad` | warning | `grant … on all tables in schema public` or `alter default privileges … grant … on tables` to anon/authenticated. It undoes the 2026-10-30 change for every table. |
 
 ## How to fix
 
@@ -80,6 +83,27 @@ grant execute on function public.admin_set_plan(uuid, text) to service_role;
 
 Revoking from `public` alone isn't enough on Supabase, because anon has its own grant on new functions.
 
+Grants (Supabase stopped granting new `public` tables to `anon`, `authenticated` and `service_role` on
+2026-10-30; older tables kept theirs). For `grants-missing`, use the statement in the finding. It grants only
+the commands the code calls, to the role that calls them: browser and SSR code runs as `authenticated`,
+code with the service role key as `service_role`, and `anon` only gets what a signed-out policy allows.
+`update` and `delete` also need `select`, because their filters read columns.
+
+```sql
+grant select, insert, update on public.todos to authenticated;
+grant select on public.posts to anon;  -- only for data meant to be public
+```
+
+Don't fix a 42501 with `grant all … to anon` or `on all tables in schema public`. If the table has RLS off,
+that opens every row to anyone with the anon key (`grant-leak`). Turn RLS on, add owner policies, then grant
+per table. To undo a leak:
+
+```sql
+revoke all on public.notes from anon, authenticated;
+alter table public.notes enable row level security;
+grant select, insert on public.notes to authenticated;
+```
+
 Storage: make private buckets private, scope reads to the owner's folder
 (`(storage.foldername(name))[1] = (select auth.uid())::text`) and serve signed URLs. Product images and logos
 can stay public.
@@ -98,7 +122,10 @@ A finding that is intended (a public catalogue, a server-only table) can be sile
 
 - Only what is in `.sql` files. Dashboard-only changes, other schemas and what a function does inside its
   body are not checked.
-- A clean result means these 9 patterns weren't found. It doesn't prove the policies match the app's rules.
+- The grant checks date a table by its migration's file name (`20261102120000_…`). A project created after
+  2026-05-30 had the new behaviour from the start; set `auto_expose_new_tables = false` in
+  `supabase/config.toml` so every migration is checked. They match `.from('<table>')` string literals only.
+- A clean result means these 12 patterns weren't found. It doesn't prove the policies match the app's rules.
   Testing as a real anon and signed-in user (the Supabase client with the anon key) is still worth doing.
 - For the browser and env side (service_role key in client code, secrets in `NEXT_PUBLIC_` variables,
   committed `.env`) run the full scan without `--only`, or use the `vibe-preflight` skill.

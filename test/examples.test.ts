@@ -7,9 +7,10 @@ const broken = findings(example("broken-app"));
 const fixed = findings(example("fixed-app"));
 
 describe("examples/broken-app", () => {
-  it("trips the six app-level checks", () => {
+  it("trips the six app-level checks, and grants-missing for its post-2026-10-30 migration", () => {
     expect(ids(broken)).toEqual([
       "env-file-committed",
+      "grants-missing",
       "public-env-secret",
       "rls-disabled",
       "rls-permissive-policy",
@@ -27,7 +28,9 @@ describe("examples/broken-app", () => {
       "rls-permissive-policy error supabase/migrations/20261101000000_init.sql:8",
       "rls-disabled error supabase/migrations/20261101000000_init.sql:14",
       "public-env-secret warning src/components/summarize-button.tsx:7",
+      "grants-missing warning supabase/migrations/20261101000000_init.sql:1",
       "rls-permissive-policy warning supabase/migrations/20261101000000_init.sql:11",
+      "grants-missing warning supabase/migrations/20261101000000_init.sql:14",
     ]);
   });
 });

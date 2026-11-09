@@ -1,0 +1,8 @@
+{
+  "name": "grants-repro-app",
+  "private": true,
+  "dependencies": {
+    "@supabase/supabase-js": "2.80.0",
+    "vite": "7.2.0"
+  }
+}
