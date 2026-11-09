@@ -1,4 +1,4 @@
-// Runs dist/index.js the way a GitHub runner does (INPUT_* variables, $GITHUB_OUTPUT, $GITHUB_STEP_SUMMARY),
+// Runs action/index.mjs the way a GitHub runner does (INPUT_* variables, $GITHUB_OUTPUT, $GITHUB_STEP_SUMMARY),
 // so the action can be tried without act or a runner.
 //   node tools/run-action-locally.mjs [path] [fail-on] [format]
 import { spawnSync } from "node:child_process";
@@ -15,7 +15,7 @@ const summary = join(temp, "summary.md");
 writeFileSync(output, "");
 writeFileSync(summary, "");
 
-const result = spawnSync(process.execPath, [join(root, "dist/index.js")], {
+const result = spawnSync(process.execPath, [join(root, "action/index.mjs")], {
   cwd: root,
   stdio: "inherit",
   env: {

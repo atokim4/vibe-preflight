@@ -1,0 +1,79 @@
+name: self-test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build and unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run check
+      - name: Committed bundles match the source
+        run: git diff --exit-code -- action skills
+
+  action:
+    name: Run the action on the examples
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Scan the broken example (report only)
+        id: broken
+        uses: ./
+        with:
+          path: examples/broken-app
+          fail-on: none
+
+      - name: Expect 9 findings, 5 of them errors, with repo-relative SARIF locations
+        env:
+          COUNT: ${{ steps.broken.outputs.findings-count }}
+          ERRORS: ${{ steps.broken.outputs.errors-count }}
+          SARIF: ${{ steps.broken.outputs.sarif-file }}
+        run: |
+          test "$COUNT" = 9
+          test "$ERRORS" = 5
+          jq -e '.version == "2.1.0" and (.runs[0].results | length) == 9' "$SARIF"
+          jq -e '[.runs[0].results[].ruleId] | sort | unique == ["grants-missing","public-env-secret","rls-disabled","rls-permissive-policy","server-secret-in-client","stripe-webhook-unverified"]' "$SARIF"
+          jq -e '.runs[0].results | all(.locations[0].physicalLocation.artifactLocation.uri | startswith("examples/broken-app/"))' "$SARIF"
+          jq -e '.runs[0].tool.driver.rules | all(.help.text | contains("Fix: "))' "$SARIF"
+
+      - name: Scan the broken example with fail-on error
+        id: gate
+        continue-on-error: true
+        uses: ./
+        with:
+          path: examples/broken-app
+          sarif-file: gate.sarif
+
+      - name: Expect that step to fail
+        env:
+          OUTCOME: ${{ steps.gate.outcome }}
+        run: test "$OUTCOME" = failure
+
+      - name: Scan the fixed example with fail-on warning, Markdown only
+        id: fixed
+        uses: ./
+        with:
+          path: examples/fixed-app
+          fail-on: warning
+          format: markdown
+
+      - name: Expect no findings and no SARIF file
+        env:
+          COUNT: ${{ steps.fixed.outputs.findings-count }}
+          SARIF: ${{ steps.fixed.outputs.sarif-file }}
+        run: |
+          test "$COUNT" = 0
+          test -z "$SARIF"

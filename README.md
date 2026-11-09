@@ -235,12 +235,12 @@ The scanner is written in TypeScript in `src/` and bundled with esbuild into
 `skills/vibe-preflight/scripts/preflight.mjs`, which is committed so the skill works without a build step.
 `npm run build` copies the same file into `supabase-rls-audit` and `stripe-webhook-security`, and a test
 checks the copies match. The GitHub Action (`src/action/`, plus `src/sarif.ts` and `src/summary.ts`) is bundled
-into `dist/index.js` the same way and committed, since a JavaScript action runs straight from the repo.
+into `action/index.mjs` the same way and committed, since a JavaScript action runs straight from the repo.
 
 ```bash
 npm install
 npm run check          # typecheck, build, 113 Vitest tests
-npm run action:local   # run dist/index.js the way a runner does, on examples/broken-app
+npm run action:local   # run action/index.mjs the way a runner does, on examples/broken-app
 npm run repro:grants   # the PGlite grants repro (Node 22.18+)
 ```
 
@@ -253,8 +253,10 @@ grants repro (`grants-repro.test.ts`, also checks `OUTPUT.txt` is current), git-
 the bundled CLI (exit codes, JSON, flags), the SARIF writer (`sarif.test.ts`), the job summary (`summary.test.ts`), the
 bundled action with runner-style inputs (`action.test.ts`), the proposal linter copy (`proposal-lint.test.ts`) and the
 SKILL.md frontmatter of every skill (`skills.test.ts`).
-[`.github/workflows/self-test.yml`](.github/workflows/self-test.yml) runs `npm run check`, checks the committed
-bundles match the source, and runs the action on both examples with the expected counts.
+[`ci/self-test.yml`](ci/self-test.yml) is a workflow that runs `npm run check`, checks the committed bundles
+match the source, and runs the action on both examples with the expected counts. It passes `actionlint`, and
+every assertion in it was run locally against the action's output, but it isn't enabled on this repo yet;
+copy it to `.github/workflows/` in a fork to run it there.
 
 ## License
 

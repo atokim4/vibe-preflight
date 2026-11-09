@@ -7,9 +7,9 @@ covers all of them.
 
 1. Bump the version in `package.json`, `src/report.ts`, `.claude-plugin/plugin.json` and
    `.cursor-plugin/plugin.json` (a test fails when they differ), and add a `CHANGELOG.md` entry.
-2. `npm run check`, then commit the rebuilt `dist/index.js` and `skills/*/scripts/preflight.mjs`. The
-   self-test workflow fails when the committed bundles don't match the source.
-3. Push to `main` and wait for `self-test` to pass.
+2. `npm run check`, then commit the rebuilt `action/index.mjs` and `skills/*/scripts/preflight.mjs`. The
+   self-test workflow (`ci/self-test.yml`) fails when the committed bundles don't match the source.
+3. Push to `main`. Once the workflow is enabled (copied to `.github/workflows/`), wait for `self-test` to pass.
 
 ## GitHub release and Marketplace listing
 

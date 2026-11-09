@@ -6,8 +6,8 @@ import { join } from "node:path";
 import { annotation, getInput, setOutput } from "../src/action/github.ts";
 import { ROOT } from "./helpers.ts";
 
-/** Runs the committed bundle (dist/index.js) like a runner does: INPUT_* variables and the runner files. */
-const ACTION = join(ROOT, "dist/index.js");
+/** Runs the committed bundle (action/index.mjs) like a runner does: INPUT_* variables and the runner files. */
+const ACTION = join(ROOT, "action/index.mjs");
 let temp: string;
 
 beforeAll(() => {
@@ -31,7 +31,7 @@ function runAction(inputs: Record<string, string>) {
   return { code: r.status, log: r.stdout + r.stderr, outputs, summary: readFileSync(files.GITHUB_STEP_SUMMARY, "utf8"), sarif: join(dir, "out.sarif") };
 }
 
-describe("dist/index.js", () => {
+describe("action/index.mjs", () => {
   it("reports the broken example, writes SARIF and outputs, and fails on errors", () => {
     const r = runAction({ path: "examples/broken-app" });
     expect(r.code).toBe(1);

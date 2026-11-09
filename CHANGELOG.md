@@ -2,7 +2,7 @@
 
 ## 1.5.0 (2026-11-09)
 
-GitHub Action (`action.yml` at the repo root, `runs.using: node24`, bundled into `dist/index.js` with no
+GitHub Action (`action.yml` at the repo root, `runs.using: node24`, bundled into `action/index.mjs` with no
 runtime dependencies):
 
 - Inputs `path`, `fail-on` (`error` | `warning` | `none`), `format` (`sarif` | `markdown`), `include`,
@@ -12,8 +12,8 @@ runtime dependencies):
   file/line location.
 - Job summary with a table of findings (linked to the commit) and the fix for each check that fired.
 - `::error` / `::warning` annotations on the reported lines.
-- `.github/workflows/self-test.yml` runs the unit tests, checks the bundles are current and runs the action
-  on both examples.
+- `ci/self-test.yml`: a workflow that runs the unit tests, checks the bundles are current and runs the
+  action on both examples (not enabled on this repo yet).
 - CLI: `--only` / `--skip` parsing moved to `src/select.ts`, shared with the action. The `--help` header said
   14 checks; it now says 17.
 
