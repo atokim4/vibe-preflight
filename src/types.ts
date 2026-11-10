@@ -32,6 +32,8 @@ export interface Project {
   git?: GitState;
   /** Supabase is used (a dependency, an import, or a supabase/ folder). The RLS checks only run then. */
   usesSupabase: boolean;
+  /** The day the scan is evaluated on (YYYY-MM-DD, UTC). Date-based checks compare against it; `--today` overrides it. */
+  today: string;
 }
 
 export interface Rule {

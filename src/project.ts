@@ -37,7 +37,10 @@ function gitState(root: string, envFiles: string[]): GitState | undefined {
   return { tracked, ignored };
 }
 
-export function loadProject(root: string): Project {
+/** Today in UTC as YYYY-MM-DD. */
+export const utcToday = (): string => new Date().toISOString().slice(0, 10);
+
+export function loadProject(root: string, today: string = utcToday()): Project {
   const files: SourceFile[] = [];
   const walk = (dir: string) => {
     for (const entry of readdirSync(dir, { withFileTypes: true })) {
@@ -89,6 +92,7 @@ export function loadProject(root: string): Project {
     gitignore: byPath.get(".gitignore")?.text,
     git: gitState(root, files.filter((f) => f.kind === "env").map((f) => f.path)),
     usesSupabase,
+    today,
   };
 }
 

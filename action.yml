@@ -19,7 +19,7 @@ inputs:
     required: false
     default: sarif
   include:
-    description: "Run only these checks. Comma- or newline-separated groups (database, secrets, stripe) or check ids. Empty runs all 17."
+    description: "Run only these checks. Comma- or newline-separated groups (database, secrets, stripe, breaking) or check ids. Empty runs all 19."
     required: false
     default: ""
   exclude:

@@ -1,5 +1,38 @@
 # Changelog
 
+## 1.6.0 (2026-11-10)
+
+Two checks for Supabase breaking changes, in a new `breaking` group (`--only breaking`) and in the
+`vibe-preflight` skill:
+
+- `server-adapter-removed`: imports of `@supabase/server/adapters/{hono,h3,elysia,nestjs}`, which Supabase
+  [removes on 2026-12-01](https://supabase.com/changelog/supabase-server-adapters-deprecated). Also finds
+  Deno `npm:` specifiers, `import()` and `require()`. Each `withSupabase(...)` registration is reported with
+  its `auth` value and the replacement from the
+  [migration guide](https://supabase.com/docs/reference/server/frameworks#moving-off-the-adapters):
+  `withRequiredClaims()` for `'user'` or no config, no gate for `'none'`, stay on `withSupabase` for
+  `'publishable'` / `'secret'`. Notes a `package.json` range below 1.6.0 and a missing `@supabase/middleware`
+  (nearest `package.json`, so monorepos work). Reads the deprecated `allow` option (`'always'`, `'public'`)
+  and mode lists. Reports reads of the adapters' `supabaseContext` in any project on `@supabase/server`,
+  since the bridges only set flat keys. Warning before the date, error from it.
+- `cron-job-direct-write` (warning): `insert into cron.job` / `update cron.job` in `supabase/migrations/*.sql`
+  and seeds (and any other `.sql`, such as Prisma migrations, in a project that uses Supabase), including DO blocks and plpgsql/sql function bodies, which Supabase
+  [blocks](https://supabase.com/changelog/19298-directly-updating-rows-in-the-cron-job-table-is-no-longer-allowed).
+  Prints the `cron.schedule` / `cron.schedule_in_database` / `cron.alter_job` rewrite when the statement
+  translates exactly (`perform` inside plpgsql), general advice otherwise. Reads and `cron.job_run_details`
+  are left alone.
+- CLI `--today YYYY-MM-DD` judges date-based checks as of that day.
+- `examples/breaking-app` and `examples/breaking-app-fixed`. The fixed Hono and NestJS files typecheck against
+  `@supabase/server` 1.9.2 and `@supabase/middleware` 1.0.0 with the official bridges copied in (checked by
+  hand, the bridges aren't committed).
+- Tests: 21 new (135 in total). The printed cron rewrites run in PGlite against stubs with pg_cron's documented
+  signatures and a role that can read but not write `cron.job`. PGlite can't load pg_cron, so this checks
+  the SQL and the argument binding, not pg_cron.
+- Checked on public code: a true positive in a public Hono API (adapter import, an
+  `allow: "user"` registration, a `supabaseContext` read); nothing reported on splitPro, the supabase/server
+  source and two repos that depend on `@supabase/server` without the adapters.
+- The plugin manifests still said 14 checks; they say 19 now.
+
 ## 1.5.0 (2026-11-09)
 
 GitHub Action (`action.yml` at the repo root, `runs.using: node24`, bundled into `action/index.mjs` with no

@@ -1,12 +1,12 @@
 {
   "name": "atokim4-vibe-preflight",
-  "description": "14 pre-launch security checks for Supabase + Stripe apps (full scan, Supabase RLS audit, Stripe webhook review), with a zero-dependency Node scanner and fix steps, plus an Upwork proposal linter.",
+  "description": "19 pre-launch checks for Supabase + Stripe apps (full scan, Supabase RLS audit, Stripe webhook review, Supabase breaking changes), with a zero-dependency Node scanner and fix steps, plus an Upwork proposal linter.",
   "owner": { "name": "Sunnatulla" },
   "plugins": [
     {
       "name": "vibe-preflight",
       "source": "./",
-      "description": "14 pre-launch security checks for Supabase + Stripe apps (full scan, Supabase RLS audit, Stripe webhook review), with a zero-dependency Node scanner and fix steps, plus an Upwork proposal linter."
+      "description": "19 pre-launch checks for Supabase + Stripe apps (full scan, Supabase RLS audit, Stripe webhook review, Supabase breaking changes), with a zero-dependency Node scanner and fix steps, plus an Upwork proposal linter."
     }
   ]
 }

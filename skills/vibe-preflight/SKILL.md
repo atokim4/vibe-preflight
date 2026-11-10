@@ -1,6 +1,6 @@
 ---
 name: vibe-preflight
-description: Pre-launch security scan for Supabase + Stripe apps (Next.js, Vite, Expo; Lovable, Bolt, Cursor and Claude Code builds). Finds public tables without Row Level Security, `using (true)` policies, user-editable plan/role columns, views and SECURITY DEFINER functions that skip RLS, `auth.users` exposed through a view, public storage buckets, missing or leaking Data API grants after Supabase's 2026-10-30 change (42501 permission denied for table), the service_role key in browser code, secrets in NEXT_PUBLIC_/VITE_/EXPO_PUBLIC_ variables, Stripe webhooks that skip signature checks or check them against a parsed body, and .env files in git. Use before deploying, before making a repo public, when reviewing a vibe-coded or AI-generated app, or when the user asks "is my Supabase/Stripe app safe to launch?".
+description: Pre-launch security scan for Supabase + Stripe apps (Next.js, Vite, Expo; Lovable, Bolt, Cursor and Claude Code builds). Finds public tables without Row Level Security, `using (true)` policies, user-editable plan/role columns, views and SECURITY DEFINER functions that skip RLS, `auth.users` exposed through a view, public storage buckets, missing or leaking Data API grants after Supabase's 2026-10-30 change (42501 permission denied for table), the service_role key in browser code, secrets in NEXT_PUBLIC_/VITE_/EXPO_PUBLIC_ variables, Stripe webhooks that skip signature checks or check them against a parsed body, .env files in git, imports of the @supabase/server framework adapters (Hono, H3, Elysia, NestJS) that Supabase removes on 2026-12-01, and direct INSERT/UPDATE on pg_cron's cron.job table. Use before deploying, before making a repo public, when reviewing a vibe-coded or AI-generated app, or when the user asks "is my Supabase/Stripe app safe to launch?".
 license: MIT
 ---
 
@@ -8,8 +8,8 @@ license: MIT
 
 A zero-dependency Node 20+ scanner ships in `scripts/preflight.mjs` next to this file. It reads the project's
 files and asks `git` which of them are tracked. It doesn't run the app, install anything or use the network.
-It reports 17 problems that keep
-showing up in apps built quickly with AI tools.
+It reports 19 problems that keep showing up in apps built quickly with AI tools, two of them Supabase
+breaking changes.
 
 ## When to run it
 
@@ -32,7 +32,8 @@ folder instead, e.g. `.agents/skills/vibe-preflight` or `.claude/skills/vibe-pre
 
 Use `--format json` when you will read the result yourself, plain text (`--explain` adds why + fix) when you
 show it to the user. Exit code: `0` no errors, `1` errors found, `2` bad arguments. Other flags:
-`--fail-on warning|never`, `--only database|secrets|stripe|<rule>`, `--skip <rule,rule>`, `--list`.
+`--fail-on warning|never`, `--only database|secrets|stripe|breaking|<rule>`, `--today YYYY-MM-DD` (judge date-based checks as of
+that day, e.g. `--today 2026-12-01` to see what fails after the adapter removal), `--skip <rule,rule>`, `--list`.
 
 JSON shape: `{ summary: { error, warning }, findings: [{ rule, severity, message, file, line }] }`.
 
@@ -182,9 +183,65 @@ An env file with values is tracked by git, or git doesn't ignore it. Add `.env*`
 `.gitignore`; for a tracked file run `git rm --cached <file>` and commit. Removing it does not remove it
 from history, so every key in it must be rotated. Don't rewrite git history yourself; offer the steps.
 
+### `server-adapter-removed` (warning until 2026-12-01, error from then)
+The code imports `@supabase/server/adapters/hono`, `/h3`, `/elysia` or `/nestjs`. Supabase
+[removes them on 2026-12-01](https://supabase.com/changelog/supabase-server-adapters-deprecated); after
+that an install or a Dependabot bump breaks the import. Follow the official guide,
+[Moving off the adapters](https://supabase.com/docs/reference/server/frameworks#moving-off-the-adapters),
+in its order:
+
+1. Versions: `@supabase/server` 1.6.0 or later, Node 22 or later. The finding says when `package.json` allows
+   an older `@supabase/server` or lacks `@supabase/middleware`.
+2. Inventory first. The scanner reports each `withSupabase(...)` registration with its `auth` value (old code
+   may say `allow`: `'always'` was `'none'`, `'public'` was `'publishable'`); show the user that list before
+   editing. A list like `['user', 'none']` is reported as not one literal; decide that one with the user.
+3. Replace by auth value. `auth: 'user'` or a bare `withSupabase()` becomes `withRequiredClaims()`;
+   `auth: 'none'` gets no gate; `auth: 'publishable'` and `auth: 'secret'` stay on `withSupabase` from
+   `@supabase/server` (no composable gate exists, don't hand-roll a key check). Never use `withClaims()` for
+   `auth: 'user'`: it lets anonymous requests through with `jwtClaims: null` and a 200.
+4. `npm install @supabase/middleware`, then copy the bridge for the framework from
+   [examples/frameworks](https://github.com/supabase/server/tree/main/examples/frameworks) as is, comments
+   included (`hono/supabase-middleware.ts`, `h3/…`, `elysia/…`, `nestjs/supabase.guard.ts`).
+
+```ts
+// Before
+import { withSupabase } from '@supabase/server/adapters/hono'
+app.use('*', withSupabase({ auth: 'user' }))
+// After
+import { withRequiredClaims } from '@supabase/server/middleware/required-claims'
+import { withSupabaseClient } from '@supabase/server/middleware/client'
+import { toHono } from './lib/supabase-middleware.js'
+app.use('*', toHono([withRequiredClaims(), withSupabaseClient()]))
+```
+
+5. Call sites: `c.var.supabaseContext.supabase` → `c.var.supabase` (same for `event.context`, the Elysia
+   context and `req`). `userClaims` is gone: `userClaims.id` → `jwtClaims.sub`, `.appMetadata` →
+   `.app_metadata`, `.userMetadata` → `.user_metadata`. Rewrite each read; a blanket rename leaves `.id`
+   undefined in plain JS. The scanner reports every `supabaseContext` read it finds, migrated or not. On Hono, give each entry array its own sub-app mounted with `app.route()`.
+6. Verify: typecheck, then for every endpoint that was `auth: 'user'` prove a request without a token still
+   gets 401. A passing typecheck doesn't show that. The 401 body is now `{ message, code }`.
+
+### `cron-job-direct-write` (warning)
+A migration or `seed.sql` runs `insert into cron.job` or `update cron.job`. Supabase
+[blocks direct writes](https://supabase.com/changelog/19298-directly-updating-rows-in-the-cron-job-table-is-no-longer-allowed)
+to pg_cron's table, so the migration fails on a Supabase project. The finding prints the rewrite when the
+statement is simple enough to translate exactly:
+
+```sql
+-- insert into cron.job (jobname, schedule, command) values ('purge', '0 3 * * *', 'select 1');
+select cron.schedule('purge', '0 3 * * *', 'select 1');   -- a name that exists is updated, so reruns are safe
+-- update cron.job set schedule = '*/10 * * * *' where jobname = 'refresh-stats';
+select cron.alter_job(jobid, schedule := '*/10 * * * *') from cron.job where jobname = 'refresh-stats';
+```
+
+Inside a DO block or a plpgsql function use `perform` instead of `select`. Another database or user:
+`cron.schedule_in_database(job_name, schedule, command, database, username, active)`. Renaming a job has no
+`alter_job` parameter: `cron.unschedule('<old>')` then `cron.schedule('<new>', …)`. Don't edit a migration
+that already ran on production; add a new one.
+
 ## Limits (tell the user when it matters)
 
-- Static checks only, 17 of them. A clean run doesn't mean the app is secure: auth flows, rate limits,
+- Static checks only, 19 of them. A clean run doesn't mean the app is secure: auth flows, rate limits,
   business logic and what happens inside function bodies are out of scope.
 - RLS checks read `.sql` files (Supabase migrations, `schema.sql`). Policies created only in the dashboard
   are invisible; suggest `supabase db pull` to get them into migrations.

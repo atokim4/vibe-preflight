@@ -26,8 +26,13 @@ function ignoredInline(project: Project, f: Finding): boolean {
   return false;
 }
 
-export function scan(root: string, skip: string[] = []): ScanResult {
-  const project = loadProject(root);
+export interface ScanOptions {
+  /** Evaluate date-based checks as of this day (YYYY-MM-DD). Defaults to today in UTC. */
+  today?: string;
+}
+
+export function scan(root: string, skip: string[] = [], options: ScanOptions = {}): ScanResult {
+  const project = loadProject(root, options.today);
   const rules = allRules.filter((r) => !skip.includes(r.id));
   const findings: Finding[] = [];
   let suppressed = 0;

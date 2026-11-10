@@ -1,6 +1,6 @@
 # vibe-preflight
 
-An Agent Skill for Claude Code, Codex and other coding agents that checks a Supabase + Stripe app for 17
+An Agent Skill for Claude Code, Codex and other coding agents that checks a Supabase + Stripe app for 19
 common launch blockers before you deploy it. The same checks also run as a GitHub Action on pull requests
 (see [Use in CI](#use-in-ci)). It ships with a small Node scanner (one file, no dependencies)
 that the agent runs, and instructions telling the agent how to read each finding and fix it.
@@ -10,7 +10,9 @@ that the agent runs, and instructions telling the agent how to read each finding
 I built this as a personal project. The checks cover mistakes that are common in Next.js and Vite apps
 generated with AI tools: RLS left off, template policies, views and functions that skip RLS, public buckets,
 the service role key in the browser, Stripe webhooks that trust any POST, and the Data API grants that
-Supabase stopped adding to new tables on 2026-10-30.
+Supabase stopped adding to new tables on 2026-10-30. Two more catch Supabase breaking changes before they
+break a deploy: the `@supabase/server` framework adapters removed on 2026-12-01, and direct writes to
+pg_cron's `cron.job` table.
 
 ## Install
 
@@ -28,7 +30,7 @@ Or as a Claude Code plugin (the repo is its own plugin marketplace):
 The repo holds four skills. `npx skills add atokim4/vibe-preflight` offers all of them; to take just one:
 
 ```bash
-npx skills add atokim4/vibe-preflight --skill vibe-preflight            # all 17 checks
+npx skills add atokim4/vibe-preflight --skill vibe-preflight            # all 19 checks
 npx skills add atokim4/vibe-preflight --skill supabase-rls-audit        # the 12 database checks
 npx skills add atokim4/vibe-preflight --skill stripe-webhook-security   # the 2 Stripe checks + a review list
 npx skills add atokim4/vibe-preflight --skill upwork-proposal-lint      # proposal linter, unrelated to security
@@ -54,7 +56,7 @@ node .claude/skills/vibe-preflight/scripts/preflight.mjs path/to/app
 
 ## Use in CI
 
-The repo is also a GitHub Action. It runs the same 17 checks, writes a SARIF file that code scanning turns
+The repo is also a GitHub Action. It runs the same 19 checks, writes a SARIF file that code scanning turns
 into alerts, adds a table of findings with the fix for each check to the job summary, and annotates the
 lines in the pull request diff. Copy this into `.github/workflows/vibe-preflight.yml`:
 
@@ -119,7 +121,7 @@ step, so on a big first run the job summary and the code scanning tab are where 
 The action needs no token and makes no network calls. It reads the checked-out files and runs `git
 ls-files`, like the CLI.
 
-## The 17 checks
+## The 19 checks
 
 | Check | Severity | What it finds |
 |---|---|---|
@@ -140,6 +142,8 @@ ls-files`, like the CLI.
 | `stripe-webhook-unverified` | error | A webhook handler that acts on Stripe events without `constructEvent` / `constructEventAsync` |
 | `stripe-webhook-parsed-body` | warning | `constructEvent` gets a body that was already parsed: `req.json()`, `JSON.stringify(...)`, `req.body` in pages/api without `bodyParser: false`, or `req.body` behind `express.json()` with no `express.raw()` |
 | `env-file-committed` | error / warning | An `.env*` file with values that git tracks or doesn't ignore. Warning only when it holds just the Supabase CLI's local demo keys or just public variables |
+| `server-adapter-removed` | warning, error from 2026-12-01 | An import of `@supabase/server/adapters/{hono,h3,elysia,nestjs}`, and each `withSupabase(...)` registration with its `auth` value and the exact bridge call that replaces it. Reads the deprecated `allow` option and mode lists too. Notes a `package.json` range below 1.6.0 and a missing `@supabase/middleware`, and flags leftover `supabaseContext` reads |
+| `cron-job-direct-write` | warning | `insert into cron.job` / `update cron.job` in `supabase/migrations/*.sql` or `seed.sql`, also inside DO blocks and function bodies, with the `cron.schedule` / `cron.schedule_in_database` / `cron.alter_job` rewrite |
 
 `SKILL.md` explains each one with the fix. The scanner also prints the why and the fix with `--explain`.
 
@@ -162,14 +166,62 @@ signed-out policy allows.
 grant taken straight from the finding, and the leak from `grant all` on a table with RLS off. The run is saved
 in [`OUTPUT.txt`](examples/grants-repro/OUTPUT.txt); `npm run repro:grants` prints it again.
 
+## Supabase breaking changes, Dec 2026
+
+`--only breaking` runs just these two. Both point at the official note and print the replacement.
+
+**Framework adapters, removed 2026-12-01.** `@supabase/server/adapters/{hono,h3,elysia,nestjs}`
+[are deprecated](https://supabase.com/changelog/supabase-server-adapters-deprecated) and go away on
+December 1, 2026. The replacement is a bridge file you copy from
+[examples/frameworks](https://github.com/supabase/server/tree/main/examples/frameworks). The risky part of the
+migration is the auth value: `auth: 'user'` has to become `withRequiredClaims()`. Using `withClaims()` instead
+compiles fine and turns the 401 for anonymous callers into a 200. So the check reports every registration
+with its auth value:
+
+```
+warning src/index.ts:7
+        `withSupabase({ auth: "user" })` is auth: 'user'. Replace it with `toHono([withRequiredClaims(), withSupabaseClient()])` (not withClaims(), which lets anonymous requests through with a 200). [server-adapter-removed]
+warning src/index.ts:9
+        `withSupabase({ auth: "secret" })` is auth: 'secret'. Keep this endpoint on `withSupabase` from '@supabase/server'; apikey auth has no composable gate. [server-adapter-removed]
+```
+
+Reads of the adapters' nested `c.var.supabaseContext` are reported too, because the bridge entries
+only set flat keys (`c.var.supabase`, `c.var.jwtClaims`) and a leftover read is `undefined`. It is a warning until the date and an error from it, so the default `--fail-on error` starts failing CI on
+2026-12-01. `--today 2026-12-01` shows that result now.
+
+**pg_cron's `cron.job` table.** Supabase
+[blocks direct INSERT/UPDATE](https://supabase.com/changelog/19298-directly-updating-rows-in-the-cron-job-table-is-no-longer-allowed)
+on it; jobs go through `cron.schedule`, `cron.schedule_in_database` and `cron.alter_job`. Migrations and seeds
+that still write the table fail on a Supabase project.
+
+```
+warning supabase/migrations/20261105000000_cron_jobs.sql:7
+        `update cron.job` writes the pg_cron table directly, which Supabase blocks; rewrite as `select cron.alter_job(jobid, schedule := '*/10 * * * *') from cron.job where jobname = 'refresh-stats';`. [cron-job-direct-write]
+```
+
+I ran both checks on public code before release. In a public
+MIT-licensed Hono API on Cloudflare Workers (`@supabase/server` `^0.1.0`) it reports the Hono adapter import, the registration (written with the old `allow: "user"`
+option, so the replacement is `withRequiredClaims()`) and the `supabaseContext` read in the next middleware.
+Two other repos that depend on `@supabase/server` without the adapters, the `supabase/server` source (adapter
+imports only in doc comments) and [splitPro](https://github.com/baz2024/splitPro) (38 SQL files, already on
+`cron.schedule` / `cron.alter_job`) came back with nothing, which is right for all four.
+
+[`examples/breaking-app`](examples/breaking-app) has both problems and
+[`examples/breaking-app-fixed`](examples/breaking-app-fixed) is the same code migrated by the guide. The fixed
+Hono and NestJS files typecheck against `@supabase/server` 1.9.2 and `@supabase/middleware` 1.0.0 with the
+official bridge files copied in. PGlite can't load pg_cron, so the tests check the printed cron rewrites
+against stub functions with pg_cron's documented signatures. That proves the SQL is valid and the arguments
+bind. It doesn't prove anything about pg_cron itself.
+
 ## Options
 
 ```
 -f, --format <text|json>              output format (default: text)
 -e, --explain                         add why each finding matters and how to fix it
     --fail-on <error|warning|never>   exit 1 at this level or above (default: error)
-    --only <group|rule,...>           run only these checks; groups: database, secrets, stripe
+    --only <group|rule,...>           run only these checks; groups: database, secrets, stripe, breaking
     --skip <rule,rule>                turn checks off for this run
+    --today <YYYY-MM-DD>              judge date-based checks as of this day (default: today, UTC)
     --list                            list the checks
 ```
 
@@ -239,7 +291,7 @@ into `action/index.mjs` the same way and committed, since a JavaScript action ru
 
 ```bash
 npm install
-npm run check          # typecheck, build, 113 Vitest tests
+npm run check          # typecheck, build, 135 Vitest tests
 npm run action:local   # run action/index.mjs the way a runner does, on examples/broken-app
 npm run repro:grants   # the PGlite grants repro (Node 22.18+)
 ```
@@ -248,7 +300,7 @@ npm run repro:grants   # the PGlite grants repro (Node 22.18+)
 `INPUT_*` variables and temporary `$GITHUB_OUTPUT` and `$GITHUB_STEP_SUMMARY` files, then prints what the
 action wrote to them.
 
-Tests are in `test/`: rule unit tests (`rules.test.ts`, `database.test.ts`, `grants.test.ts`), the two example apps, the PGlite
+Tests are in `test/`: rule unit tests (`rules.test.ts`, `database.test.ts`, `grants.test.ts`), the example apps, the Dec 2026 breaking-change checks with the cron rewrites run against pg_cron-signature stubs in PGlite (`breaking.test.ts`), the PGlite
 grants repro (`grants-repro.test.ts`, also checks `OUTPUT.txt` is current), git-tracked env files in a temporary repo,
 the bundled CLI (exit codes, JSON, flags), the SARIF writer (`sarif.test.ts`), the job summary (`summary.test.ts`), the
 bundled action with runner-style inputs (`action.test.ts`), the proposal linter copy (`proposal-lint.test.ts`) and the

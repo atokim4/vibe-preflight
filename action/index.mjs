@@ -50,7 +50,8 @@ function gitState(root, envFiles) {
   }
   return { tracked, ignored };
 }
-function loadProject(root) {
+var utcToday = () => (/* @__PURE__ */ new Date()).toISOString().slice(0, 10);
+function loadProject(root, today = utcToday()) {
   const files = [];
   const walk = (dir) => {
     for (const entry of readdirSync(dir, { withFileTypes: true })) {
@@ -94,7 +95,8 @@ function loadProject(root) {
     byPath,
     gitignore: byPath.get(".gitignore")?.text,
     git: gitState(root, files.filter((f) => f.kind === "env").map((f) => f.path)),
-    usesSupabase
+    usesSupabase,
+    today
   };
 }
 function isDirectory(path) {
@@ -200,7 +202,7 @@ function splitSql(file) {
       i++;
     }
   }
-  const statements = [];
+  const statements2 = [];
   let start = 0;
   let line = 1;
   let startLine = 1;
@@ -211,14 +213,14 @@ function splitSql(file) {
       const norm = raw.replace(/\s+/g, " ").trim().replace(/("[^"]*")|[^"]+/g, (part, quoted) => quoted ?? part.toLowerCase());
       if (norm) {
         const lead = raw.length - raw.trimStart().length;
-        statements.push({ file: file.path, line: startLine + raw.slice(0, lead).split("\n").length - 1, norm });
+        statements2.push({ file: file.path, line: startLine + raw.slice(0, lead).split("\n").length - 1, norm });
       }
       start = k + 1;
       startLine = line;
     }
     if (ch === "\n") line++;
   }
-  return statements;
+  return statements2;
 }
 function tableName(raw) {
   const parts = raw.replace(/"/g, "").split(".");
@@ -887,21 +889,21 @@ var grantsMissing = {
           need(c.role, p);
           if (c.role === "authenticated" && anonNeeds(t, p)) need("anon", p);
         }
-      const statements = [];
+      const statements2 = [];
       for (const role of API_ROLE_NAMES) {
         const missing = ordered([...needs.get(role) ?? []].filter((p) => !t.grants.get(role)?.has(p)));
         if (!missing.length) continue;
-        statements.push(`grant ${missing.join(", ")} on ${t.name} to ${role};`);
+        statements2.push(`grant ${missing.join(", ")} on ${t.name} to ${role};`);
         if (missing.includes("insert"))
-          for (const col of t.serialColumns) statements.push(`grant usage on sequence ${t.name}_${col}_seq to ${role};`);
+          for (const col of t.serialColumns) statements2.push(`grant usage on sequence ${t.name}_${col}_seq to ${role};`);
       }
-      if (!statements.length) continue;
+      if (!statements2.length) continue;
       const first = used[0];
       const call = `.from('${short2(t.name)}') at ${where(first)}${used.length > 1 ? ` and ${used.length - 1} more` : ""}`;
       out.push({
         rule: this.id,
         severity: this.severity,
-        message: `\`${t.name}\` ${WHY_NO_GRANTS[t.exposure]}: supabase-js will 42501 "permission denied for table ${short2(t.name)}" on ${call}. Minimal grant: \`${statements.join(" ")}\`` + (t.rls ? "" : " Enable RLS and add policies first: a grant on a table without RLS opens every row."),
+        message: `\`${t.name}\` ${WHY_NO_GRANTS[t.exposure]}: supabase-js will 42501 "permission denied for table ${short2(t.name)}" on ${call}. Minimal grant: \`${statements2.join(" ")}\`` + (t.rls ? "" : " Enable RLS and add policies first: a grant on a table without RLS opens every row."),
         file: t.file,
         line: t.line
       });
@@ -1213,6 +1215,403 @@ var webhookParsedBody = {
   }
 };
 
+// src/rules/server-adapters.ts
+var ADAPTERS_REMOVED_ON = "2026-12-01";
+var BRIDGE_MIN_VERSION = [1, 6, 0];
+var BRIDGES_URL = "https://github.com/supabase/server/tree/main/examples/frameworks";
+var BRIDGES = {
+  hono: { file: "hono/supabase-middleware.ts", saveAs: "src/lib/supabase-middleware.ts", call: (e) => `toHono([${e}])` },
+  h3: { file: "h3/supabase-middleware.ts", saveAs: "src/lib/supabase-middleware.ts", call: (e) => `toH3([${e}])` },
+  elysia: {
+    file: "elysia/supabase-middleware.ts",
+    saveAs: "src/lib/supabase-middleware.ts",
+    call: (e) => `wrapElysia([${e}], (req) => app.handle(req))`,
+    note: "served as the fetch handler, with `.use(supabaseCtx<typeof entries>())` on the app"
+  },
+  nestjs: {
+    file: "nestjs/supabase.guard.ts",
+    saveAs: "src/lib/supabase.guard.ts",
+    call: (e) => `toNestGuard([${e}])`,
+    note: "called once into a const that every @UseGuards() reuses; @SupabaseCtx() reads become `@Req() req: Contributions<typeof entries>`"
+  }
+};
+var ADAPTER_IMPORT = /(?:\bfrom\s*|\bimport\s*\(\s*|\brequire\s*\(\s*|\bimport\s+)(["'`])(?:npm:)?@supabase\/server(?:@[^/"'`\s]+)?\/adapters\/(hono|h3|elysia|nestjs)\1/g;
+function minVersion(range) {
+  const m = /^\s*(?:[\^~]|>=?|=)?\s*v?(\d+)\.(\d+)(?:\.(\d+))?/.exec(range.replace(/^npm:@supabase\/server@/, ""));
+  return m ? [Number(m[1]), Number(m[2]), Number(m[3] ?? 0)] : void 0;
+}
+var older = (a, b) => a[0] - b[0] || a[1] - b[1] || a[2] - b[2];
+function nearestPackage(project, file) {
+  const parts = file.split("/").slice(0, -1);
+  for (let i = parts.length; i >= 0; i--) {
+    const path = [...parts.slice(0, i), "package.json"].join("/");
+    const pkg = project.byPath.get(path);
+    if (!pkg) continue;
+    try {
+      const json = JSON.parse(pkg.text);
+      return { path, deps: { ...json.devDependencies, ...json.dependencies } };
+    } catch {
+      return void 0;
+    }
+  }
+  return void 0;
+}
+var daysUntil = (today, day) => Math.round((Date.parse(day) - Date.parse(today)) / 864e5);
+var removedBy = (today) => daysUntil(today, ADAPTERS_REMOVED_ON) <= 0;
+function callArgs(code, open) {
+  let depth = 0;
+  for (let i = open; i < code.length; i++) {
+    const c = code[i];
+    if (c === "(") depth++;
+    else if (c === ")" && --depth === 0) return code.slice(open + 1, i);
+  }
+  return code.slice(open + 1);
+}
+var MODE_ALIASES = { user: "user", none: "none", always: "none", publishable: "publishable", public: "publishable", secret: "secret" };
+function optionModes(args, key) {
+  const at = new RegExp(`\\b${key}\\s*:\\s*`).exec(args);
+  if (!at) return void 0;
+  const rest = args.slice(at.index + at[0].length);
+  const single = /^(["'`])([^"'`]*)\1/.exec(rest);
+  const list3 = /^\[([^\]]*)\]/.exec(rest);
+  const raw = single ? [single[2]] : list3 ? [...list3[1].matchAll(/(["'`])([^"'`]*)\1/g)].map((m) => m[2]) : [];
+  if (!raw.length || list3 && list3[1].replace(/(["'`])[^"'`]*\1/g, "").replace(/[\s,]/g, "")) return ["dynamic"];
+  return raw.map((mode) => MODE_ALIASES[mode.split(":")[0]] ?? "dynamic");
+}
+function authValue(args) {
+  const hasKey = (key) => new RegExp(`\\b${key}\\s*:`).test(args);
+  if (!hasKey("auth") && !hasKey("allow")) return "user";
+  const modes = optionModes(args, hasKey("auth") ? "auth" : "allow");
+  const unique = [...new Set(modes)];
+  if (unique.length === 1) return unique[0];
+  if (unique.includes("publishable") || unique.includes("secret")) return unique.includes("secret") ? "secret" : "publishable";
+  return "dynamic";
+}
+function replacement(adapter, auth) {
+  const bridge = BRIDGES[adapter];
+  const note = bridge.note ? `, ${bridge.note}` : "";
+  switch (auth) {
+    case "user":
+      return `Replace it with \`${bridge.call("withRequiredClaims(), withSupabaseClient()")}\` (not withClaims(), which lets anonymous requests through with a 200)${note}.`;
+    case "none":
+      return `Replace it with \`${bridge.call("withSupabaseClient()")}\`${note}, no gate.`;
+    case "publishable":
+    case "secret":
+      return "Keep this endpoint on `withSupabase` from '@supabase/server'; apikey auth has no composable gate.";
+    case "dynamic":
+      return "Decide it by hand: 'user' needs withRequiredClaims(), 'none' no gate, 'publishable' or 'secret' stays on withSupabase.";
+  }
+}
+function withSupabaseNames(code) {
+  const names = /* @__PURE__ */ new Set();
+  const IMPORT_CLAUSE = /\bimport\s*(?:type\s+)?\{([^}]*)\}\s*from\s*["'`](?:npm:)?@supabase\/server(?:@[^/"'`\s]+)?\/adapters\/[a-z0-9]+["'`]/g;
+  for (const m of code.matchAll(IMPORT_CLAUSE)) {
+    for (const spec of m[1].split(",")) {
+      const named = /^\s*withSupabase(?:\s+as\s+([A-Za-z_$][\w$]*))?\s*$/.exec(spec);
+      if (named) names.add(named[1] ?? "withSupabase");
+    }
+  }
+  if (/\{\s*withSupabase\s*\}\s*=\s*(?:await\s+import|require)\s*\(\s*["'`][^"'`]*\/adapters\//.test(code)) names.add("withSupabase");
+  return [...names];
+}
+function adapterFindings(project, f, rule) {
+  const code = stripJsComments(f.text);
+  const imports = [...code.matchAll(ADAPTER_IMPORT)];
+  if (!imports.length) return [];
+  const left = daysUntil(project.today, ADAPTERS_REMOVED_ON);
+  const removed = removedBy(project.today);
+  const severity = removed ? "error" : "warning";
+  const when = removed ? `was removed on ${ADAPTERS_REMOVED_ON}` : `is removed on ${ADAPTERS_REMOVED_ON} (${left} day${left === 1 ? "" : "s"} left)`;
+  const pkg = nearestPackage(project, f.path);
+  const notes = [];
+  const range = pkg?.deps["@supabase/server"];
+  const min = range ? minVersion(range) : void 0;
+  if (range && min && older(min, BRIDGE_MIN_VERSION) < 0)
+    notes.push(`${pkg.path} allows @supabase/server ${range}; the bridges need 1.6.0 or later`);
+  if (pkg && !("@supabase/middleware" in pkg.deps)) notes.push("add @supabase/middleware as a direct dependency (the bridge imports it)");
+  const out = [];
+  const adapters = /* @__PURE__ */ new Set();
+  for (const m of imports) {
+    const adapter2 = m[2];
+    adapters.add(adapter2);
+    const bridge = BRIDGES[adapter2];
+    out.push({
+      rule: rule.id,
+      severity,
+      message: `\`@supabase/server/adapters/${adapter2}\` ${when}. Copy \`${bridge.file}\` from supabase/server examples/frameworks to \`${bridge.saveAs}\`` + (notes.length ? `; ${notes.join("; ")}` : "") + ".",
+      file: f.path,
+      line: lineAt(f.text, m.index)
+    });
+  }
+  const adapter = adapters.size === 1 ? [...adapters][0] : void 0;
+  for (const name of withSupabaseNames(code)) {
+    const CALL = new RegExp(`(?<![\\w$.])${name.replace(/\$/g, "\\$")}\\s*(?:<[^>()]*>)?\\s*\\(`, "g");
+    for (const call of code.matchAll(CALL)) {
+      const args = callArgs(code, call.index + call[0].length - 1).trim();
+      const auth = authValue(args);
+      const shown = `${name}(${args.length > 60 ? args.slice(0, 57) + "..." : args})`.replace(/\s+/g, " ");
+      out.push({
+        rule: rule.id,
+        severity,
+        message: `\`${shown}\` ${auth === "dynamic" ? "has an auth value that isn't one literal" : `is auth: '${auth}'`}. ${replacement(adapter ?? "hono", auth).replace(adapter ? /^$/ : /toHono/g, "the bridge")}`,
+        file: f.path,
+        line: lineAt(f.text, call.index)
+      });
+    }
+  }
+  return out;
+}
+var CONTEXT_READ = /\.\s*supabaseContext\b|\.get\s*\(\s*["'`]supabaseContext["'`]\s*\)|\[\s*["'`]supabaseContext["'`]\s*\]/g;
+function contextReadFindings(f, rule, severity) {
+  const code = stripJsComments(f.text);
+  return [...code.matchAll(CONTEXT_READ)].map((m) => ({
+    rule: rule.id,
+    severity,
+    message: "Reads the adapters' `supabaseContext`, which the bridge entries don't set. Use the flat keys (`c.var.supabase`, `c.var.supabaseAdmin`, `c.var.jwtClaims`); `userClaims` is gone, so `.id` becomes `jwtClaims.sub`, `.appMetadata` `.app_metadata`, `.userMetadata` `.user_metadata`.",
+    file: f.path,
+    line: lineAt(f.text, m.index)
+  }));
+}
+var dependsOnServer = (project) => project.files.some((f) => /(^|\/)package\.json$/.test(f.path) && /"@supabase\/server"\s*:/.test(f.text));
+var serverAdapterRemoved = {
+  id: "server-adapter-removed",
+  severity: "error",
+  title: "@supabase/server framework adapter (removed 2026-12-01)",
+  why: "Supabase removes `@supabase/server/adapters/{hono,h3,elysia,nestjs}` on 2026-12-01, so an install or a Dependabot bump after that breaks the import. The migration has one silent trap: replacing `auth: 'user'` with `withClaims()` turns a 401 into a 200 for anonymous callers. Warning before the date, error from it.",
+  fix: `Follow https://supabase.com/docs/reference/server/frameworks#moving-off-the-adapters. Need @supabase/server 1.6.0+ and Node 22+, add @supabase/middleware as a direct dependency, copy your framework's bridge from ${BRIDGES_URL} as is (comments included). Then: auth 'user' (or a bare withSupabase()) becomes \`toHono([withRequiredClaims(), withSupabaseClient()])\` with imports from '@supabase/server/middleware/required-claims' and '/middleware/client'; auth 'none' becomes \`toHono([withSupabaseClient()])\`; 'publishable' and 'secret' stay on withSupabase from '@supabase/server'. Rewrite \`c.var.supabaseContext.supabase\` to \`c.var.supabase\` and \`userClaims.id\` to \`jwtClaims.sub\` (field by field, no blanket rename). Then prove each gated endpoint still answers 401 without a token.`,
+  check(project) {
+    const sources = project.files.filter((f) => f.kind === "source");
+    const imports = sources.flatMap((f) => adapterFindings(project, f, this));
+    if (!imports.length && !dependsOnServer(project)) return [];
+    const severity = removedBy(project.today) ? "error" : "warning";
+    return [...imports, ...sources.flatMap((f) => contextReadFindings(f, this, severity))];
+  }
+};
+
+// src/rules/cron.ts
+var CHANGELOG = "https://supabase.com/changelog/19298-directly-updating-rows-in-the-cron-job-table-is-no-longer-allowed";
+var DIRECT_WRITE = /^(insert\s+into|update)\s+(?:only\s+)?"?cron"?\s*\.\s*"?job"?(?![\w$"])/i;
+var PLPGSQL_LEAD = /^(?:(?:begin|then|else|loop|exception\s+when\s+[\w\s]+?\s+then)\s+)+/i;
+function dollarTag(src, i) {
+  return /^\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$/.exec(src.slice(i, i + 64))?.[0];
+}
+function skipQuoted(src, i) {
+  const c = src[i];
+  if (c === "'" || c === '"') {
+    let j = i + 1;
+    while (j < src.length) {
+      if (src[j] === c && src[j + 1] === c) j += 2;
+      else if (src[j] === c) break;
+      else j++;
+    }
+    return { end: Math.min(j + 1, src.length) };
+  }
+  if (c === "$") {
+    const tag = dollarTag(src, i);
+    if (!tag) return void 0;
+    const close = src.indexOf(tag, i + tag.length);
+    const bodyEnd = close === -1 ? src.length : close;
+    return { end: close === -1 ? src.length : close + tag.length, body: { start: i + tag.length, end: bodyEnd } };
+  }
+  return void 0;
+}
+function blankSqlComments(src) {
+  let out = "";
+  let i = 0;
+  while (i < src.length) {
+    if (src[i] === "-" && src[i + 1] === "-") {
+      const nl = src.indexOf("\n", i);
+      const stop = nl === -1 ? src.length : nl;
+      out += blank(src.slice(i, stop));
+      i = stop;
+    } else if (src[i] === "/" && src[i + 1] === "*") {
+      const close = src.indexOf("*/", i + 2);
+      const stop = close === -1 ? src.length : close + 2;
+      out += blank(src.slice(i, stop));
+      i = stop;
+    } else {
+      const q = skipQuoted(src, i);
+      if (q?.body) {
+        out += src.slice(i, q.body.start) + blankSqlComments(src.slice(q.body.start, q.body.end)) + src.slice(q.body.end, q.end);
+        i = q.end;
+      } else if (q) {
+        out += src.slice(i, q.end);
+        i = q.end;
+      } else {
+        out += src[i];
+        i++;
+      }
+    }
+  }
+  return out;
+}
+function statements(src, from, to) {
+  const out = [];
+  let start = from;
+  let bodies = [];
+  let i = from;
+  const push = (end) => {
+    if (src.slice(start, end).trim()) out.push({ span: { start, end }, bodies });
+    bodies = [];
+  };
+  while (i < to) {
+    const q = skipQuoted(src, i);
+    if (q) {
+      if (q.body) bodies.push({ start: q.body.start, end: Math.min(q.body.end, to) });
+      i = Math.min(q.end, to);
+    } else if (src[i] === ";") {
+      push(i);
+      start = ++i;
+    } else i++;
+  }
+  push(to);
+  return out;
+}
+function splitTopLevel2(s) {
+  const parts = [];
+  let depth = 0;
+  let last = 0;
+  let i = 0;
+  while (i < s.length) {
+    const q = skipQuoted(s, i);
+    if (q) {
+      i = q.end;
+      continue;
+    }
+    if (s[i] === "(") depth++;
+    else if (s[i] === ")") depth--;
+    else if (s[i] === "," && depth === 0) {
+      parts.push(s.slice(last, i).trim());
+      last = i + 1;
+    }
+    i++;
+  }
+  parts.push(s.slice(last).trim());
+  return parts;
+}
+function parenthesized(s, open) {
+  if (s[open] !== "(") return void 0;
+  let depth = 0;
+  let i = open;
+  while (i < s.length) {
+    const q = skipQuoted(s, i);
+    if (q) {
+      i = q.end;
+      continue;
+    }
+    if (s[i] === "(") depth++;
+    else if (s[i] === ")" && --depth === 0) return { inner: s.slice(open + 1, i), after: i + 1 };
+    i++;
+  }
+  return void 0;
+}
+var column = (raw) => raw.replace(/"/g, "").trim().toLowerCase();
+var PARAMS = {
+  jobname: "job_name",
+  schedule: "schedule",
+  command: "command",
+  database: "database",
+  username: "username",
+  active: "active"
+};
+var MAX_ARG = 48;
+var shorten = (value, name) => value.length > MAX_ARG ? `<${name}>` : value;
+function insertRewrite(stmt) {
+  const head = /^insert\s+into\s+(?:only\s+)?"?cron"?\s*\.\s*"?job"?\s*/i.exec(stmt);
+  if (!head) return void 0;
+  const cols = parenthesized(stmt, head[0].length);
+  if (!cols) return void 0;
+  const valuesAt = /^\s*values\s*/i.exec(stmt.slice(cols.after));
+  if (!valuesAt) return void 0;
+  const vals = parenthesized(stmt, cols.after + valuesAt[0].length);
+  if (!vals) return void 0;
+  const rest = stmt.slice(vals.after).trim();
+  if (rest && !/^(on\s+conflict|returning)\b/i.test(rest)) return void 0;
+  const names = splitTopLevel2(cols.inner).map(column);
+  const values = splitTopLevel2(vals.inner);
+  if (names.length !== values.length) return void 0;
+  const row = /* @__PURE__ */ new Map();
+  for (const [k, name2] of names.entries()) {
+    if (name2 === "jobid") continue;
+    if (!(name2 in PARAMS)) return void 0;
+    row.set(name2, values[k]);
+  }
+  const schedule = row.get("schedule");
+  const command = row.get("command");
+  if (!schedule || !command) return void 0;
+  const v = (name2) => shorten(row.get(name2), name2);
+  const name = row.get("jobname");
+  const extras = ["username", "active"].filter((k) => row.has(k));
+  if (!row.has("database") && !extras.length) {
+    return name ? `select cron.schedule(${v("jobname")}, ${v("schedule")}, ${v("command")});` : `select cron.schedule(${v("schedule")}, ${v("command")});`;
+  }
+  if (!name) return void 0;
+  const database2 = row.has("database") ? v("database") : "current_database()";
+  const named = extras.map((k) => `${k} := ${v(k)}`);
+  return `select cron.schedule_in_database(${[v("jobname"), v("schedule"), v("command"), database2, ...named].join(", ")});`;
+}
+function updateRewrite(stmt) {
+  const m = /^update\s+(?:only\s+)?"?cron"?\s*\.\s*"?job"?\s+set\s+([\s\S]*?)(?:\s+where\s+([\s\S]*?))?\s*(?:returning\b[\s\S]*)?$/i.exec(stmt.trim());
+  if (!m) return void 0;
+  const named = [];
+  for (const item of splitTopLevel2(m[1])) {
+    const eq = /^("?[A-Za-z_]+"?)\s*=\s*([\s\S]+)$/.exec(item);
+    if (!eq) return void 0;
+    const col = column(eq[1]);
+    if (col === "jobname" || !(col in PARAMS)) return void 0;
+    named.push(`${col} := ${shorten(eq[2].trim(), col)}`);
+  }
+  if (!named.length) return void 0;
+  const where2 = m[2]?.trim();
+  const byId = where2 && /^"?jobid"?\s*=\s*(\d+)$/i.exec(where2);
+  if (byId) return `select cron.alter_job(${byId[1]}, ${named.join(", ")});`;
+  return `select cron.alter_job(jobid, ${named.join(", ")}) from cron.job${where2 ? ` where ${where2}` : ""};`;
+}
+function cronFindings(file, rule) {
+  const src = blankSqlComments(file.text);
+  const out = [];
+  const visit = (from, to, plpgsql) => {
+    for (const { span, bodies } of statements(src, from, to)) {
+      const raw = src.slice(span.start, span.end);
+      let lead = raw.search(/\S/);
+      if (plpgsql) lead += PLPGSQL_LEAD.exec(raw.slice(lead))?.[0].length ?? 0;
+      const at = span.start + lead;
+      const stmt = src.slice(at, span.end);
+      const write = DIRECT_WRITE.exec(stmt);
+      if (write) {
+        const insert = /^insert/i.test(write[1]);
+        let rewrite = insert ? insertRewrite(stmt) : updateRewrite(stmt);
+        if (rewrite && plpgsql) rewrite = rewrite.replace(/^select /, "perform ");
+        const verb = insert ? "insert into" : "update";
+        const fallback = insert ? "use `select cron.schedule('<name>', '<schedule>', $$<command>$$);` instead" : "use `select cron.alter_job(<jobid>, schedule := \u2026, command := \u2026, active := \u2026);` instead (a rename is cron.unschedule + cron.schedule)";
+        out.push({
+          rule: rule.id,
+          severity: rule.severity,
+          message: `\`${verb} cron.job\` writes the pg_cron table directly, which Supabase blocks; ${rewrite ? `rewrite as \`${rewrite}\`` : fallback}.`,
+          file: file.path,
+          line: lineAt(file.text, at)
+        });
+        continue;
+      }
+      const procedural = /^do\b/i.test(stmt) || /^create\s+(?:or\s+replace\s+)?(?:function|procedure)\b/i.test(stmt) && /\blanguage\s+'?plpgsql\b/i.test(stmt);
+      for (const b of bodies) visit(b.start, b.end, procedural);
+    }
+  };
+  visit(0, src.length, false);
+  return out;
+}
+var isSupabaseSql = (f) => /(^|\/)supabase\/(?:migrations\/[^/]+|seed|seeds?\/[^/]+)\.sql$/.test(f.path);
+var cronJobDirectWrite = {
+  id: "cron-job-direct-write",
+  severity: "warning",
+  title: "Direct INSERT/UPDATE on pg_cron's cron.job table",
+  why: `Supabase doesn't allow writing \`cron.job\` rows directly, because that skips the checks pg_cron's functions make (${CHANGELOG}). The migration or seed fails with a permission error on a Supabase project, often only in CI or on the first deploy.`,
+  fix: "Create jobs with `select cron.schedule('<name>', '<schedule>', $$<command>$$);` (a name that exists updates that job, so it's safe to rerun), or `cron.schedule_in_database(...)` for another database or user. Change one with `select cron.alter_job(<jobid>, schedule := \u2026, command := \u2026, active := \u2026);`, or for a name `select cron.alter_job(jobid, active := false) from cron.job where jobname = '<name>';`. Remove one with `select cron.unschedule('<name>');`.",
+  check(project) {
+    return project.files.filter((f) => f.kind === "sql" && (isSupabaseSql(f) || project.usesSupabase)).flatMap((f) => cronFindings(f, this));
+  }
+};
+
 // src/rules/index.ts
 var allRules = [
   rlsDisabled,
@@ -1231,12 +1630,16 @@ var allRules = [
   publicEnvSecret,
   webhookUnverified,
   webhookParsedBody,
-  envFileCommitted
+  envFileCommitted,
+  serverAdapterRemoved,
+  cronJobDirectWrite
 ];
 var ruleGroups = {
   database: [rlsDisabled, rlsPermissivePolicy, rlsNoPolicy, rlsUpdatePrivilegedColumn, viewBypassesRls, authUsersExposed, definerSearchPath, definerFunctionAnon, storagePublicBucket, grantLeak, grantsMissing, grantBroad].map((r) => r.id),
   secrets: [serverSecretInClient, publicEnvSecret, envFileCommitted].map((r) => r.id),
-  stripe: [webhookUnverified, webhookParsedBody].map((r) => r.id)
+  stripe: [webhookUnverified, webhookParsedBody].map((r) => r.id),
+  /** Supabase breaking changes that make code or migrations fail after an upgrade or a cutoff date. */
+  breaking: [serverAdapterRemoved, cronJobDirectWrite].map((r) => r.id)
 };
 
 // src/scan.ts
@@ -1252,8 +1655,8 @@ function ignoredInline(project, f) {
   }
   return false;
 }
-function scan(root, skip = []) {
-  const project = loadProject(root);
+function scan(root, skip = [], options = {}) {
+  const project = loadProject(root, options.today);
   const rules = allRules.filter((r) => !skip.includes(r.id));
   const findings = [];
   let suppressed = 0;
@@ -1279,7 +1682,7 @@ function failsAt(findings, level) {
 }
 
 // src/report.ts
-var VERSION = "1.5.0";
+var VERSION = "1.6.0";
 var plural = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
 function summary(r) {
   const c = counts(r.findings);
@@ -1313,7 +1716,7 @@ function text(r, color, explain) {
 // src/sarif.ts
 var SARIF_SCHEMA = "https://json.schemastore.org/sarif-2.1.0.json";
 var INFORMATION_URI = "https://github.com/atokim4/vibe-preflight";
-var CHECKS_URI = `${INFORMATION_URI}#the-17-checks`;
+var CHECKS_URI = `${INFORMATION_URI}#the-19-checks`;
 var SECURITY_SEVERITY = { error: "8.0", warning: "5.0" };
 var pascal = (id) => id.replace(/(^|-)([a-z0-9])/g, (_, __, c) => c.toUpperCase());
 var plain = (s) => s.replace(/`/g, "");

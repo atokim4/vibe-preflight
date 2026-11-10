@@ -69,20 +69,30 @@ describe("preflight.mjs", () => {
     expect(run(broken, "--fail-on", "never").code).toBe(0);
     const skipped = run(broken, "--format", "json", "--skip", "rls-disabled,env-file-committed");
     expect(JSON.parse(skipped.out).findings.map((f: { rule: string }) => f.rule)).not.toContain("rls-disabled");
-    expect(JSON.parse(skipped.out).rules).toHaveLength(15);
+    expect(JSON.parse(skipped.out).rules).toHaveLength(17);
   });
 
   it("exits 2 with a message on bad input", () => {
-    for (const args of [["--format", "xml"], ["--fail-on", "info"], ["--skip", "nope"], ["/does/not/exist"], ["--bogus"], ["a", "b"]]) {
+    for (const args of [["--format", "xml"], ["--fail-on", "info"], ["--skip", "nope"], ["/does/not/exist"], ["--bogus"], ["a", "b"], ["--today", "2026-02-30"], ["--today", "tomorrow"]]) {
       const r = run(...args);
       expect(r.code, args.join(" ")).toBe(2);
       expect(r.err).toMatch(/^vibe-preflight: /);
     }
   });
 
-  it("lists the 17 checks", () => {
+  it("lists the 19 checks", () => {
     const r = run("--list");
     expect(r.code).toBe(0);
-    expect(r.out.trim().split("\n")).toHaveLength(17);
+    expect(r.out.trim().split("\n")).toHaveLength(19);
+  });
+
+  it("--today moves the adapter removal date check: warning before 2026-12-01, failing error from it", () => {
+    const dir = join(ROOT, "examples/breaking-app");
+    const before = run(dir, "--only", "breaking", "--today", "2026-11-30", "--format", "json");
+    expect(before.code).toBe(0);
+    expect(JSON.parse(before.out).summary).toEqual({ error: 0, warning: 13 });
+    const after = run(dir, "--only", "breaking", "--today", "2026-12-01", "--format", "json");
+    expect(after.code).toBe(1);
+    expect(JSON.parse(after.out).summary).toEqual({ error: 8, warning: 5 });
   });
 });

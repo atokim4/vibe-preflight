@@ -5,7 +5,7 @@ import { failsAt, scan } from "./scan.ts";
 import { json, ruleList, text, VERSION } from "./report.ts";
 import { parseList, rulesToSkip, SelectionError } from "./select.ts";
 
-const HELP = `vibe-preflight ${VERSION}: 17 pre-launch security checks for Supabase + Stripe apps (Next.js, Vite, Expo)
+const HELP = `vibe-preflight ${VERSION}: 19 pre-launch checks for Supabase + Stripe apps (Next.js, Vite, Expo, Hono…)
 
 Usage
   node preflight.mjs [dir]              scan a project (default: current directory)
@@ -15,8 +15,9 @@ Options
   -f, --format <text|json>              output format (default: text)
   -e, --explain                         text output: add why each finding matters and how to fix it
       --fail-on <error|warning|never>   exit 1 when a finding at this level or above exists (default: error)
-      --only <group|rule,...>           run only these checks; groups: database, secrets, stripe
+      --only <group|rule,...>           run only these checks; groups: database, secrets, stripe, breaking
       --skip <rule,rule>                turn checks off for this run
+      --today <YYYY-MM-DD>              judge date-based checks as of this day (e.g. 2026-12-01)
       --no-color                        plain text (NO_COLOR is respected too)
   -h, --help / -v, --version
 
@@ -25,6 +26,12 @@ Silence one finding with a "vibe-preflight-ignore <rule-id>" comment on its line
 `;
 
 class UsageError extends Error {}
+
+/** A real calendar day written as YYYY-MM-DD. */
+function isDay(s: string): boolean {
+  const t = Date.parse(`${s}T00:00:00Z`);
+  return /^\d{4}-\d{2}-\d{2}$/.test(s) && !Number.isNaN(t) && new Date(t).toISOString().startsWith(s);
+}
 
 function run(argv: string[]): number {
   let parsed;
@@ -38,6 +45,7 @@ function run(argv: string[]): number {
         "fail-on": { type: "string", default: "error" },
         only: { type: "string" },
         skip: { type: "string" },
+        today: { type: "string" },
         "no-color": { type: "boolean", default: false },
         list: { type: "boolean", default: false },
         help: { type: "boolean", short: "h", default: false },
@@ -70,7 +78,10 @@ function run(argv: string[]): number {
     throw error;
   }
 
-  const result = scan(dir, skip);
+  const today = values.today;
+  if (today !== undefined && !isDay(today)) throw new UsageError(`--today must be a date like 2026-12-01 (got "${today}")`);
+
+  const result = scan(dir, skip, { today });
   const color = !values["no-color"] && !process.env.NO_COLOR && process.stdout.isTTY === true;
   process.stdout.write(format === "json" ? json(result) : text(result, color, values.explain));
 

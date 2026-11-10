@@ -20,14 +20,14 @@ Developer Agreement accepted once; the Publish checkbox stays disabled without t
 2. Tick **Publish this Action to the GitHub Marketplace**. The page checks `action.yml` (name, description,
    branding) and must say everything looks good.
 3. Primary category: **Security**. Secondary: **Code quality**.
-4. Tag `v1.5.0` on `main`, title `v1.5.0`, notes from `CHANGELOG.md`. Publish.
+4. Tag `v1.6.0` on `main`, title `v1.6.0`, notes from `CHANGELOG.md`. Publish.
 
 ## The `v1` tag
 
 Workflows use `atokim4/vibe-preflight@v1`, so `v1` has to point at the newest 1.x release:
 
 ```bash
-git tag -f v1 v1.5.0
+git tag -f v1 v1.6.0
 git push -f origin v1
 ```
 

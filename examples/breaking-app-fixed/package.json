@@ -1,0 +1,15 @@
+{
+  "name": "breaking-app-fixed",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "@nestjs/common": "11.2.9",
+    "@supabase/middleware": "^1.0.0",
+    "@supabase/server": "^1.9.2",
+    "@supabase/supabase-js": "2.80.0",
+    "hono": "4.13.17"
+  }
+}

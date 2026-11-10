@@ -1,0 +1,11 @@
+{
+  "name": "breaking-app",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@nestjs/common": "11.2.9",
+    "@supabase/server": "^1.4.0",
+    "@supabase/supabase-js": "2.80.0",
+    "hono": "4.13.17"
+  }
+}

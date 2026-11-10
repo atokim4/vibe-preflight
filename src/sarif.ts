@@ -5,7 +5,7 @@ import { VERSION } from "./report.ts";
 
 export const SARIF_SCHEMA = "https://json.schemastore.org/sarif-2.1.0.json";
 export const INFORMATION_URI = "https://github.com/atokim4/vibe-preflight";
-const CHECKS_URI = `${INFORMATION_URI}#the-17-checks`;
+const CHECKS_URI = `${INFORMATION_URI}#the-19-checks`;
 
 /**
  * GitHub's security-severity score per default level: 7.0-8.9 shows as "High", 4.0-6.9 as "Medium".

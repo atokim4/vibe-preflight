@@ -1,8 +1,8 @@
 {
   "name": "vibe-preflight",
-  "version": "1.5.0",
+  "version": "1.6.0",
   "private": true,
-  "description": "Agent Skill, GitHub Action and zero-dependency scanner: 17 pre-launch security checks for Supabase + Stripe apps.",
+  "description": "Agent Skill, GitHub Action and zero-dependency scanner: 19 pre-launch checks for Supabase + Stripe apps, including the 2026-12-01 @supabase/server adapter removal.",
   "type": "module",
   "license": "MIT",
   "engines": {
