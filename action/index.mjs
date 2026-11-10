@@ -5,7 +5,53 @@ import { dirname, isAbsolute, relative as relative2, resolve, sep as sep2 } from
 // src/project.ts
 import { execFileSync } from "node:child_process";
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
-import { basename, join, relative, sep } from "node:path";
+import { join, relative, sep } from "node:path";
+
+// src/model.ts
+var SOURCE_EXT = /\.(?:ts|tsx|js|jsx|mjs|cjs|mts|cts)$/;
+var ENV_FILE = /^\.env(?:\..+)?$/;
+var utcToday = () => (/* @__PURE__ */ new Date()).toISOString().slice(0, 10);
+function fileKind(path) {
+  const slash = path.lastIndexOf("/");
+  const name = path.slice(slash + 1);
+  const dir = slash === -1 ? "" : path.slice(0, slash);
+  if (SOURCE_EXT.test(name) && !name.endsWith(".d.ts")) return "source";
+  if (name.endsWith(".sql")) return "sql";
+  if (ENV_FILE.test(name)) return "env";
+  if (name === "package.json" || name === ".gitignore") return "other";
+  if (name === "config.toml" && (dir === "supabase" || dir.endsWith("/supabase"))) return "other";
+  return void 0;
+}
+function buildProject(root, loaded, git2, today = utcToday()) {
+  const files = [...loaded].sort((a, b) => a.path.localeCompare(b.path));
+  const byPath = new Map(files.map((f) => [f.path, f]));
+  let pkg = {};
+  try {
+    pkg = JSON.parse(byPath.get("package.json")?.text ?? "{}");
+  } catch {
+  }
+  const deps = { ...pkg.dependencies, ...pkg.devDependencies };
+  const frameworks = [];
+  const hasAppLayout = files.some((f) => /^(src\/)?app\/layout\.[jt]sx?$/.test(f.path));
+  if ("next" in deps || hasAppLayout) frameworks.push("next");
+  else if ("vite" in deps) frameworks.push("vite");
+  if ("expo" in deps) frameworks.push("expo");
+  if (!frameworks.length) frameworks.push("unknown");
+  const usesSupabase = Object.keys(deps).some((d) => d.startsWith("@supabase/")) || files.some((f) => f.path.startsWith("supabase/") || f.kind === "source" && /from\s+["'](?:npm:|jsr:)?@supabase\//.test(f.text));
+  return {
+    root,
+    name: typeof pkg.name === "string" ? pkg.name : root.split(/[\\/]/).filter(Boolean).pop() ?? root,
+    frameworks,
+    files,
+    byPath,
+    gitignore: byPath.get(".gitignore")?.text,
+    git: git2,
+    usesSupabase,
+    today
+  };
+}
+
+// src/project.ts
 var SKIP_DIRS = /* @__PURE__ */ new Set([
   "node_modules",
   ".git",
@@ -27,8 +73,6 @@ var SKIP_DIRS = /* @__PURE__ */ new Set([
   "playwright-report",
   "test-results"
 ]);
-var SOURCE_EXT = /\.(?:ts|tsx|js|jsx|mjs|cjs|mts|cts)$/;
-var ENV_FILE = /^\.env(?:\..+)?$/;
 var MAX_FILE_BYTES = 1e6;
 var SELF = "preflight.mjs";
 function git(root, args, input) {
@@ -50,7 +94,6 @@ function gitState(root, envFiles) {
   }
   return { tracked, ignored };
 }
-var utcToday = () => (/* @__PURE__ */ new Date()).toISOString().slice(0, 10);
 function loadProject(root, today = utcToday()) {
   const files = [];
   const walk = (dir) => {
@@ -61,43 +104,15 @@ function loadProject(root, today = utcToday()) {
         continue;
       }
       if (!entry.isFile() || entry.name === SELF) continue;
-      let kind;
-      if (SOURCE_EXT.test(entry.name) && !entry.name.endsWith(".d.ts")) kind = "source";
-      else if (entry.name.endsWith(".sql")) kind = "sql";
-      else if (ENV_FILE.test(entry.name)) kind = "env";
-      else if (entry.name === "package.json" || entry.name === ".gitignore") kind = "other";
-      else if (entry.name === "config.toml" && basename(dir) === "supabase") kind = "other";
+      const path = relative(root, abs).split(sep).join("/");
+      const kind = fileKind(path);
       if (!kind || statSync(abs).size > MAX_FILE_BYTES) continue;
-      files.push({ path: relative(root, abs).split(sep).join("/"), text: readFileSync(abs, "utf8"), kind });
+      files.push({ path, text: readFileSync(abs, "utf8"), kind });
     }
   };
   walk(root);
-  files.sort((a, b) => a.path.localeCompare(b.path));
-  const byPath = new Map(files.map((f) => [f.path, f]));
-  let pkg = {};
-  try {
-    pkg = JSON.parse(byPath.get("package.json")?.text ?? "{}");
-  } catch {
-  }
-  const deps = { ...pkg.dependencies, ...pkg.devDependencies };
-  const frameworks = [];
-  const hasAppLayout = files.some((f) => /^(src\/)?app\/layout\.[jt]sx?$/.test(f.path));
-  if ("next" in deps || hasAppLayout) frameworks.push("next");
-  else if ("vite" in deps) frameworks.push("vite");
-  if ("expo" in deps) frameworks.push("expo");
-  if (!frameworks.length) frameworks.push("unknown");
-  const usesSupabase = Object.keys(deps).some((d) => d.startsWith("@supabase/")) || files.some((f) => f.path.startsWith("supabase/") || f.kind === "source" && /from\s+["'](?:npm:|jsr:)?@supabase\//.test(f.text));
-  return {
-    root,
-    name: typeof pkg.name === "string" ? pkg.name : basename(root),
-    frameworks,
-    files,
-    byPath,
-    gitignore: byPath.get(".gitignore")?.text,
-    git: gitState(root, files.filter((f) => f.kind === "env").map((f) => f.path)),
-    usesSupabase,
-    today
-  };
+  const git2 = gitState(root, files.filter((f) => f.kind === "env").map((f) => f.path));
+  return buildProject(root, files, git2, today);
 }
 function isDirectory(path) {
   return existsSync(path) && statSync(path).isDirectory();
@@ -146,7 +161,7 @@ function hasDirective(src, directive) {
   const body = stripJsComments(src).trimStart();
   return body.startsWith(`"${directive}"`) || body.startsWith(`'${directive}'`);
 }
-function basename2(path) {
+function basename(path) {
   return path.slice(path.lastIndexOf("/") + 1);
 }
 function globToRegExp(glob) {
@@ -1061,7 +1076,7 @@ var serverSecretInClient = {
         out.push({
           rule: this.id,
           severity: this.severity,
-          message: `${basename2(f.path)} runs in the browser and uses ${m[1] ? `\`${what}\`` : "the `service_role` key"}.`,
+          message: `${basename(f.path)} runs in the browser and uses ${m[1] ? `\`${what}\`` : "the `service_role` key"}.`,
           file: f.path,
           line: lineAt(f.text, m.index)
         });
@@ -1088,9 +1103,14 @@ var HAS_VALUE = /^\s*(?:export\s+)?[A-Za-z_][A-Za-z0-9_]*\s*=\s*\S/m;
 var REAL_KEY = /\b(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{8,}|\bwhsec_[A-Za-z0-9]{8,}|\bsb_secret_[A-Za-z0-9_-]{8,}|\bsk-[A-Za-z0-9_-]{20,}|\bAKIA[A-Z0-9]{16}\b|\bgh[pousr]_[A-Za-z0-9]{20,}/;
 var JWT_ANY = /\beyJ[A-Za-z0-9_-]+\.eyJ/;
 var JWT = /\beyJ[A-Za-z0-9_-]+\.(eyJ[A-Za-z0-9_-]+)\.[A-Za-z0-9_-]+/g;
+function decodeBase64Url(data) {
+  const b64 = data.replace(/-/g, "+").replace(/_/g, "/");
+  const bytes = Uint8Array.from(atob(b64.padEnd(Math.ceil(b64.length / 4) * 4, "=")), (c) => c.charCodeAt(0));
+  return new TextDecoder().decode(bytes);
+}
 function jwtIssuer(payload) {
   try {
-    return JSON.parse(Buffer.from(payload, "base64url").toString("utf8")).iss;
+    return JSON.parse(decodeBase64Url(payload)).iss;
   } catch {
     return void 0;
   }
@@ -1642,7 +1662,7 @@ var ruleGroups = {
   breaking: [serverAdapterRemoved, cronJobDirectWrite].map((r) => r.id)
 };
 
-// src/scan.ts
+// src/engine.ts
 var IGNORE = /vibe-preflight-ignore\b([\w\s,-]*)/;
 function ignoredInline(project, f) {
   const lines = project.byPath.get(f.file)?.text.split("\n");
@@ -1655,8 +1675,7 @@ function ignoredInline(project, f) {
   }
   return false;
 }
-function scan(root, skip = [], options = {}) {
-  const project = loadProject(root, options.today);
+function scanProject(project, skip = []) {
   const rules = allRules.filter((r) => !skip.includes(r.id));
   const findings = [];
   let suppressed = 0;
@@ -1681,8 +1700,13 @@ function failsAt(findings, level) {
   return findings.some((f) => SEVERITY_ORDER[f.severity] >= SEVERITY_ORDER[level]);
 }
 
+// src/scan.ts
+function scan(root, skip = [], options = {}) {
+  return scanProject(loadProject(root, options.today), skip);
+}
+
 // src/report.ts
-var VERSION = "1.6.0";
+var VERSION = "1.6.1";
 var plural = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
 function summary(r) {
   const c = counts(r.findings);

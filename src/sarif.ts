@@ -1,5 +1,5 @@
 import type { Rule, Severity } from "./types.ts";
-import type { ScanResult } from "./scan.ts";
+import type { ScanResult } from "./engine.ts";
 import { ruleGroups } from "./rules/index.ts";
 import { VERSION } from "./report.ts";
 

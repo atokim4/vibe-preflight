@@ -2,7 +2,8 @@
 
 An Agent Skill for Claude Code, Codex and other coding agents that checks a Supabase + Stripe app for 19
 common launch blockers before you deploy it. The same checks also run as a GitHub Action on pull requests
-(see [Use in CI](#use-in-ci)). It ships with a small Node scanner (one file, no dependencies)
+(see [Use in CI](#use-in-ci)). Its upgrade checks (`--only breaking` and the grants checks) also run in the browser at
+[upgrade-check-2026.netlify.app](https://upgrade-check-2026.netlify.app), on any public GitHub repo. It ships with a small Node scanner (one file, no dependencies)
 that the agent runs, and instructions telling the agent how to read each finding and fix it.
 
 ![vibe-preflight output on the sample broken app](media/output.png)
@@ -51,6 +52,8 @@ yourself, with Node 20 or newer:
 ```bash
 node .claude/skills/vibe-preflight/scripts/preflight.mjs path/to/app
 ```
+
+or without installing anything: `npx github:atokim4/vibe-preflight path/to/app`.
 
 (the folder depends on the agent you installed the skill for).
 

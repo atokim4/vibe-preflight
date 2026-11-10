@@ -1,5 +1,5 @@
 import type { Finding, Rule } from "./types.ts";
-import { counts, type ScanResult } from "./scan.ts";
+import { counts, type ScanResult } from "./engine.ts";
 import { VERSION } from "./report.ts";
 
 export interface SummaryOptions {

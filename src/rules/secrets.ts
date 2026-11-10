@@ -125,9 +125,16 @@ const REAL_KEY = /\b(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{8,}|\bwhsec_[A-Za-z0-9]{
 const JWT_ANY = /\beyJ[A-Za-z0-9_-]+\.eyJ/;
 const JWT = /\beyJ[A-Za-z0-9_-]+\.(eyJ[A-Za-z0-9_-]+)\.[A-Za-z0-9_-]+/g;
 
+/** base64url to text with web APIs only (atob, TextDecoder), so the rule also runs in a browser. */
+function decodeBase64Url(data: string): string {
+  const b64 = data.replace(/-/g, "+").replace(/_/g, "/");
+  const bytes = Uint8Array.from(atob(b64.padEnd(Math.ceil(b64.length / 4) * 4, "=")), (c) => c.charCodeAt(0));
+  return new TextDecoder().decode(bytes);
+}
+
 function jwtIssuer(payload: string): string | undefined {
   try {
-    return (JSON.parse(Buffer.from(payload, "base64url").toString("utf8")) as { iss?: unknown }).iss as string | undefined;
+    return (JSON.parse(decodeBase64Url(payload)) as { iss?: unknown }).iss as string | undefined;
   } catch {
     return undefined;
   }

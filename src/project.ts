@@ -1,14 +1,15 @@
 import { execFileSync } from "node:child_process";
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
-import { basename, join, relative, sep } from "node:path";
-import type { Framework, GitState, Project, SourceFile } from "./types.ts";
+import { join, relative, sep } from "node:path";
+import { buildProject, fileKind, utcToday } from "./model.ts";
+import type { GitState, Project, SourceFile } from "./types.ts";
 
-const SKIP_DIRS = new Set([
+export { utcToday } from "./model.ts";
+
+export const SKIP_DIRS = new Set([
   "node_modules", ".git", ".next", ".nuxt", ".output", ".vercel", ".netlify", ".turbo", ".cache", ".expo",
   "dist", "build", "out", "coverage", ".svelte-kit", "vendor", ".pnpm-store", "playwright-report", "test-results",
 ]);
-const SOURCE_EXT = /\.(?:ts|tsx|js|jsx|mjs|cjs|mts|cts)$/;
-const ENV_FILE = /^\.env(?:\..+)?$/;
 const MAX_FILE_BYTES = 1_000_000;
 /** The bundled scanner contains the patterns it looks for. */
 const SELF = "preflight.mjs";
@@ -37,9 +38,6 @@ function gitState(root: string, envFiles: string[]): GitState | undefined {
   return { tracked, ignored };
 }
 
-/** Today in UTC as YYYY-MM-DD. */
-export const utcToday = (): string => new Date().toISOString().slice(0, 10);
-
 export function loadProject(root: string, today: string = utcToday()): Project {
   const files: SourceFile[] = [];
   const walk = (dir: string) => {
@@ -50,50 +48,15 @@ export function loadProject(root: string, today: string = utcToday()): Project {
         continue;
       }
       if (!entry.isFile() || entry.name === SELF) continue;
-      let kind: SourceFile["kind"] | undefined;
-      if (SOURCE_EXT.test(entry.name) && !entry.name.endsWith(".d.ts")) kind = "source";
-      else if (entry.name.endsWith(".sql")) kind = "sql";
-      else if (ENV_FILE.test(entry.name)) kind = "env";
-      else if (entry.name === "package.json" || entry.name === ".gitignore") kind = "other";
-      else if (entry.name === "config.toml" && basename(dir) === "supabase") kind = "other";
+      const path = relative(root, abs).split(sep).join("/");
+      const kind = fileKind(path);
       if (!kind || statSync(abs).size > MAX_FILE_BYTES) continue;
-      files.push({ path: relative(root, abs).split(sep).join("/"), text: readFileSync(abs, "utf8"), kind });
+      files.push({ path, text: readFileSync(abs, "utf8"), kind });
     }
   };
   walk(root);
-  files.sort((a, b) => a.path.localeCompare(b.path));
-
-  const byPath = new Map(files.map((f) => [f.path, f]));
-  let pkg: { name?: unknown; dependencies?: Record<string, string>; devDependencies?: Record<string, string> } = {};
-  try {
-    pkg = JSON.parse(byPath.get("package.json")?.text ?? "{}");
-  } catch {
-    // A broken package.json only costs us framework detection.
-  }
-  const deps = { ...pkg.dependencies, ...pkg.devDependencies };
-
-  const frameworks: Framework[] = [];
-  const hasAppLayout = files.some((f) => /^(src\/)?app\/layout\.[jt]sx?$/.test(f.path));
-  if ("next" in deps || hasAppLayout) frameworks.push("next");
-  else if ("vite" in deps) frameworks.push("vite");
-  if ("expo" in deps) frameworks.push("expo");
-  if (!frameworks.length) frameworks.push("unknown");
-
-  const usesSupabase =
-    Object.keys(deps).some((d) => d.startsWith("@supabase/")) ||
-    files.some((f) => f.path.startsWith("supabase/") || (f.kind === "source" && /from\s+["'](?:npm:|jsr:)?@supabase\//.test(f.text)));
-
-  return {
-    root,
-    name: typeof pkg.name === "string" ? pkg.name : basename(root),
-    frameworks,
-    files,
-    byPath,
-    gitignore: byPath.get(".gitignore")?.text,
-    git: gitState(root, files.filter((f) => f.kind === "env").map((f) => f.path)),
-    usesSupabase,
-    today,
-  };
+  const git = gitState(root, files.filter((f) => f.kind === "env").map((f) => f.path));
+  return buildProject(root, files, git, today);
 }
 
 export function isDirectory(path: string): boolean {

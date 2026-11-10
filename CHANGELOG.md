@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.6.1 (2026-11-10)
+
+No rule changes. The file-system and git code moved out of the scan engine (`src/model.ts` and
+`src/engine.ts` are pure now), so the same checks also run in a browser. The JWT check decodes with `atob` instead of Node's `Buffer`.
+`package.json` has a `bin`, so `npx github:atokim4/vibe-preflight .` runs the scanner.
+
 ## 1.6.0 (2026-11-10)
 
 Two checks for Supabase breaking changes, in a new `breaking` group (`--only breaking`) and in the
