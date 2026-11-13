@@ -253,7 +253,8 @@ of the SELECT, so two requests both read `pending` and both write. Fix it one of
   every `pool.query` can take a different connection. Prisma: `prisma.$transaction(async (tx) => …)` and
   `tx.$queryRaw`. Drizzle: `db.transaction(async (tx) => …)` and `tx.select()…for('update')`. Knex:
   `knex.transaction(async (trx) => …)` or `.transacting(trx)`. Sequelize: `{ transaction: t, lock: t.LOCK.UPDATE }`.
-  asyncpg: `async with pool.acquire() as conn, conn.transaction():`. psycopg with autocommit on:
+  postgres.js / Neon: a tagged `` sql`…` `` is its own transaction, so use `sql.begin(async (tx) => …)` and
+  `` tx`…` ``. asyncpg: `async with pool.acquire() as conn, conn.transaction():`. psycopg with autocommit on:
   `with conn.transaction():`.
 
 Keep slow calls (Stripe, Telegram, email) out of the locked transaction when you can; the lock blocks every
@@ -266,7 +267,10 @@ The code reads a status, balance or stock, decides in application code, then wri
 Move the condition into the write: `… WHERE id = $1 AND status = 'pending'`, or a relative update
 `SET balance = balance - $2 WHERE id = $1 AND balance >= $2`, and act on the row count. If the decision really
 needs the row first, read it with `FOR UPDATE` inside the transaction that writes. Raw SQL only: ORM
-read-modify-write (`product.stock -= qty` then commit) has the same race and isn't scanned.
+read-modify-write (`product.stock -= qty` then commit) has the same race and isn't scanned. Not reported: a row
+the same function just inserted (`INSERT … RETURNING`, invisible to others until commit), PATCH handlers that
+write back `${body.status ?? existing.status}`, and files under `scripts/`, `seeds/` or `migrations/`. A
+worker that already claimed the row (a lease column set by its caller) can still show up: check the caller.
 
 ## Limits (tell the user when it matters)
 

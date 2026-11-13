@@ -214,13 +214,15 @@ describe("for-update-autocommit: Python", () => {
       "        conn.execute('SELECT status FROM orders WHERE id = %s FOR UPDATE', (order_id,))",
     ].join("\n");
     expect(lines({ "app/pay.py": code })).toEqual([]);
-    expect(lines({ "app/pay.py": code, "app/db.py": "import psycopg\nconn = psycopg.connect(DSN, autocommit=True)\n" })).toEqual(["app/pay.py:4"]);
+    expect(lines({ "app/pay.py": `from app.db import conn\n${code}`, "app/db.py": "import psycopg\nconn = psycopg.connect(DSN, autocommit=True)\n" })).toEqual(["app/pay.py:5"]);
+    // Autocommit in a module this code never imports (an evals or admin helper) says nothing about its connection.
+    expect(lines({ "app/pay.py": code, "evals/scratch_db.py": "admin = create_engine(URL, isolation_level='AUTOCOMMIT')\n" })).toEqual([]);
   });
 
   it("SQLAlchemy with_for_update only matters with AUTOCOMMIT isolation; Django needs no rule", () => {
     const orm = "from sqlalchemy import select\ndef pay(session, id):\n    o = session.execute(select(Order).where(Order.id == id).with_for_update()).scalar_one()\n";
     expect(lines({ "app/pay.py": orm })).toEqual([]);
-    expect(lines({ "app/pay.py": orm, "app/db.py": "from sqlalchemy import create_engine\nengine = create_engine(URL, isolation_level='AUTOCOMMIT')\n" })).toEqual(["app/pay.py:3"]);
+    expect(lines({ "app/pay.py": `from .db import engine\n${orm}`, "app/db.py": "from sqlalchemy import create_engine\nengine = create_engine(URL, isolation_level='AUTOCOMMIT')\n" })).toEqual(["app/pay.py:4"]);
     expect(lines({ "shop/views.py": "from django.db import transaction\ndef pay(request, pk):\n    order = Order.objects.select_for_update().get(pk=pk)\n" })).toEqual([]);
   });
 
@@ -280,6 +282,131 @@ describe("check-then-act", () => {
           "}",
           "export async function d(id) {",
           "  await pool.query(\"update orders set status = 'paid' where id = $1\", [id]);",
+          "}",
+        ].join("\n"),
+      }),
+    ).toEqual([]);
+  });
+});
+
+// Cases from the 2026-11 census of public booking / wallet / payment repos (RESULTS.md in the for-update-check notes).
+describe("census fixtures", () => {
+  const PGJS = JSON.stringify({ name: "api", dependencies: { postgres: "3.4.7" } });
+
+  it("postgres.js: flags sql`… FOR UPDATE` outside sql.begin, passes sql.begin, claim-in-one-UPDATE and a tx passed in", () => {
+    const list = locks({
+      "package.json": PGJS,
+      "src/db/index.ts": "import postgres from 'postgres';\nexport const sql = postgres(process.env.DATABASE_URL!);\n",
+      "src/cron/send.ts": [
+        "import { sql } from '../db';",
+        "export async function runScheduled() {",
+        "  const due = await sql<Row[]>`",
+        "    SELECT id FROM scheduled_messages WHERE sent_at IS NULL ORDER BY send_at LIMIT 50",
+        "    FOR UPDATE SKIP LOCKED`;",
+        "  for (const row of due) await send(row);",
+        "}",
+        "export async function inTx() {",
+        "  return sql.begin(async (tx) => {",
+        "    const rows = await tx`SELECT id FROM scheduled_messages LIMIT 50 FOR UPDATE SKIP LOCKED`;",
+        "    return rows;",
+        "  });",
+        "}",
+        "export async function claim() {",
+        "  return sql`UPDATE scheduled_messages SET status = 'sending' WHERE id IN (SELECT id FROM scheduled_messages WHERE status = 'queued' FOR UPDATE SKIP LOCKED) RETURNING *`;",
+        "}",
+        "export async function helper(tx: Tx, id: string) {",
+        "  return tx`SELECT * FROM scheduled_messages WHERE id = ${id} FOR UPDATE`;",
+        "}",
+      ].join("\n"),
+    });
+    expect(list.map((f) => `${f.file}:${f.line}`)).toEqual(["src/cron/send.ts:5"]);
+    expect(list[0]!.message).toContain("sql.begin(async (tx)");
+  });
+
+  it("postgres.js: leaves drizzle's sql builder alone", () => {
+    expect(
+      lines({
+        "package.json": PGJS,
+        "src/db.ts": "import postgres from 'postgres';\nexport const sql = postgres(URL);\n",
+        "src/jobs.ts": "import { sql } from 'drizzle-orm';\nexport const q = (db) => db.execute(sql`SELECT id FROM jobs FOR UPDATE SKIP LOCKED`);\n",
+      }),
+    ).toEqual([]);
+  });
+
+  it("psycopg: an autocommit admin connection to the postgres database, or a script, doesn't make the app autocommit", () => {
+    const service = [
+      "import psycopg",
+      "def lock_patient(conn, patient_id):",
+      "    conn.execute('SELECT id FROM patients WHERE id = %s FOR UPDATE', [patient_id])",
+      "def lock_global(patient_id):",
+      "    db.execute('SELECT id FROM patients WHERE id = %s FOR UPDATE', [patient_id])",
+    ].join("\n");
+    const admin = "def admin_conn(url):\n    return connect(with_dbname(url, \"postgres\"), autocommit=True)\n";
+    expect(lines({ "src/app/service.py": service, "src/app/loader.py": admin })).toEqual([]);
+    expect(lines({ "src/app/service.py": service, "scripts/bench.py": "admin = create_engine(URL, isolation_level='AUTOCOMMIT')\n" })).toEqual([]);
+    // The app's own connection in autocommit: the module-level connection is flagged, the one passed in is the caller's.
+    expect(lines({ "src/app/service.py": `from app import db\n${service}`, "src/app/db.py": "db = psycopg.connect(DSN, autocommit=True)\n" })).toEqual(["src/app/service.py:6"]);
+  });
+
+  it("check-then-act: passes a row the function inserted itself, PATCH merges and one-off scripts", () => {
+    expect(
+      races({
+        "package.json": PG,
+        "src/post.ts": [
+          "export async function post(db, input) {",
+          "  return db.transaction(async (tx) => {",
+          "    const ins = await tx.execute(sql`INSERT INTO transactions (status, key) VALUES ('pending', ${input.key}) ON CONFLICT DO NOTHING RETURNING *`);",
+          "    if (!ins.rows.length) { const old = await tx.execute(sql`SELECT * FROM transactions WHERE key = ${input.key}`); return old.rows[0]; }",
+          "    await tx.execute(sql`UPDATE transactions SET status = 'completed' WHERE id = ${ins.rows[0].id}`);",
+          "  });",
+          "}",
+        ].join("\n"),
+        "src/routes/forms.ts": [
+          "router.patch('/:id', async (c) => {",
+          "  const [existing] = await sql`SELECT * FROM forms WHERE id = ${c.req.param('id')}`;",
+          "  const [form] = await sql`UPDATE forms SET name = ${d.name ?? existing.name}, status = ${d.status ?? existing.status} WHERE id = ${existing.id} RETURNING *`;",
+          "});",
+        ].join("\n"),
+        "scripts/archive.ts": [
+          "export async function main() {",
+          "  const [row] = await sql`SELECT id, status FROM workflows WHERE name = ${n}`;",
+          "  if (row.status !== 'archived') await sql`UPDATE workflows SET status = 'archived' WHERE id = ${row.id}`;",
+          "}",
+        ].join("\n"),
+      }),
+    ).toEqual([]);
+  });
+
+  it("check-then-act: still flags a cancel that reads the status through the pool and writes it unguarded", () => {
+    const list = races({
+      "package.json": PG,
+      "src/hall.ts": [
+        "export async function cancelBooking(ctx, bookingId) {",
+        "  const b = await ctx.pool.query('SELECT showtime_id, status FROM booking WHERE booking_id = $1', [bookingId]);",
+        "  if (b.rows[0].status !== 'PENDING') throw new Error('not pending');",
+        "  const client = await ctx.pool.connect();",
+        "  await client.query('BEGIN');",
+        "  await client.query(\"UPDATE booking SET status = 'CANCELLED' WHERE booking_id = $1\", [bookingId]);",
+        "  await client.query('COMMIT');",
+        "}",
+      ].join("\n"),
+    });
+    expect(list.map((f) => f.line)).toEqual([6]);
+  });
+
+  it("check-then-act: passes the same flow once the row is re-read with FOR UPDATE inside the transaction", () => {
+    expect(
+      races({
+        "package.json": PG,
+        "src/hall.ts": [
+          "export async function payBooking(ctx, bookingId) {",
+          "  const b = await ctx.pool.query('SELECT showtime_id, status FROM booking WHERE booking_id = $1', [bookingId]);",
+          "  const client = await ctx.pool.connect();",
+          "  await client.query('BEGIN');",
+          "  const locked = await client.query('SELECT status FROM booking WHERE booking_id = $1 FOR UPDATE', [bookingId]);",
+          "  if (locked.rows[0]?.status !== 'PENDING') throw new Error('not pending');",
+          "  await client.query(\"UPDATE booking SET status = 'CONFIRMED' WHERE booking_id = $1\", [bookingId]);",
+          "  await client.query('COMMIT');",
           "}",
         ].join("\n"),
       }),

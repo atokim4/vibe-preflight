@@ -1,5 +1,25 @@
 # Changelog
 
+## 1.7.1 (2026-11-13)
+
+Tuned on a census of 122 public booking, wallet and payment repos (48 with row-lock code in JS/TS/Python), with
+every finding and every lock site reviewed by hand.
+
+- `for-update-autocommit` now covers postgres.js and Neon tagged templates: `` sql`SELECT … FOR UPDATE` ``
+  outside `sql.begin(...)` (two real misses in the census, both job claims with `SKIP LOCKED`). Files that import
+  `sql` from drizzle-orm, kysely or slonik are left alone, as are claims done inside one `UPDATE`.
+- Python: autocommit now counts only for code that imports the module turning it on (or lives in it). An admin
+  engine for `CREATE DATABASE`, an evals helper or a script no longer marks the whole project as autocommit
+  (3 false positives in the census, 44 in one more repo checked afterwards). A connection passed in as a
+  parameter is the caller's, as in JS.
+- `check-then-act`: no longer reports an UPDATE of a row the same function inserted with `RETURNING`, PATCH
+  handlers that write back `${body.status ?? existing.status}`, one-off scripts, seeds and migrations (seven
+  false positives), or a status read again with `FOR UPDATE` earlier in the same function, which is the fix it
+  suggests.
+- Census result: 1.7.0 reported 30 findings (18 real, 12 false) and missed 2; 1.7.1 reports 22 (20 real, 2 false:
+  a worker updating rows its caller already claimed with a guarded UPDATE) and none of the 128 lock lines read by
+  hand were missed.
+
 ## 1.7.0 (2026-11-13)
 
 Two checks for races in Postgres code, in a new `concurrency` group (`--only concurrency`) and in the

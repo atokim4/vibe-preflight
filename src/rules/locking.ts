@@ -132,19 +132,23 @@ interface ProjectHints {
   pools: Set<string>;
   /** Identifiers created with `new Client(…)`. */
   clients: Set<string>;
+  /** Tagged-template clients: postgres.js `postgres(…)` and Neon `neon(…)`, where `` sql`…` `` runs the query itself. */
+  sqlTags: Set<string>;
   sequelize: boolean;
 }
 
 function projectHints(project: Project, sources: SourceFile[]): ProjectHints {
   const pools = new Set<string>();
   const clients = new Set<string>();
+  const sqlTags = new Set<string>();
   for (const f of sources) {
+    for (const m of f.text.matchAll(/(?:const|let|var|export\s+const)\s+([A-Za-z_$][\w$]*)\s*(?::[^=]+)?=\s*(?:postgres|neon)\s*\(/g)) sqlTags.add(m[1]!);
     for (const m of f.text.matchAll(/(?:const|let|var|export\s+const)\s+([A-Za-z_$][\w$]*)\s*(?::[^=]+)?=\s*(?:new\s+(?:pg\.|postgres\.)?Pool\b|(?:mysql\.)?createPool\s*\(|postgres\s*\()/g)) pools.add(m[1]!);
     for (const m of f.text.matchAll(/(?:const|let|var|export\s+const)\s+([A-Za-z_$][\w$]*)\s*(?::[^=]+)?=\s*new\s+(?:pg\.)?Client\b/g)) clients.add(m[1]!);
     for (const m of f.text.matchAll(/this\.(\w+)\s*=\s*new\s+(?:pg\.)?Pool\b/g)) pools.add(`this.${m[1]}`);
   }
   const pkg = project.files.filter((f) => f.path.endsWith("package.json")).map((f) => f.text).join("\n");
-  return { pools, clients, sequelize: /"sequelize"\s*:/.test(pkg) };
+  return { pools, clients, sqlTags, sequelize: /"sequelize"\s*:/.test(pkg) };
 }
 
 /** BEGIN / START TRANSACTION sent through `receiver` inside the function body. */
@@ -210,6 +214,24 @@ function checkJsLocks(rule: Rule, f: SourceFile, hints: ProjectHints): Finding[]
       if (!localConn && (isParam(fns, base) || base === "this")) continue; // a connection passed in: the caller may hold the transaction
       report(at, `No BEGIN on \`${call.receiver}\` in ${where}, so this FOR UPDATE runs in autocommit and the row lock ends with the statement. Send BEGIN first and COMMIT after the write, on the same client.`);
     }
+  }
+
+  // postgres.js / Neon: `` sql`SELECT … FOR UPDATE` `` is the query itself and runs in autocommit unless it's inside
+  // `sql.begin(async (sql) => …)`. Builders with the same tag name (drizzle-orm, kysely) only build SQL, so a file that
+  // imports `sql` from one of them is left out.
+  const builderSql = /import\s*\{[^}]*\bsql\b[^}]*\}\s*from\s*["'](?:drizzle-orm[^"']*|kysely|slonik|@databases\/[^"']+)["']/.test(f.text);
+  for (const lit of lexed.literals) {
+    if (builderSql || f.text[lit.start] !== "`") continue;
+    const rel = lockingSelect(lit.value);
+    if (rel === undefined) continue;
+    const tag = /(?<![\w$.])([A-Za-z_$][\w$]*)\s*(?:<[^`;]*>)?\s*$/.exec(lexed.code.slice(Math.max(0, lit.start - 120), lit.start))?.[1];
+    if (!tag || !hints.sqlTags.has(tag) || insideTxCall(lexed, lit.start)) continue;
+    const fns = jsFunctionsAround(lexed, lit.start);
+    if (isParam(fns, tag)) continue; // `async (sql) => …` callbacks and helpers that get the transaction passed in
+    report(
+      lit.start + 1 + rel,
+      `\`${tag}\`…\`\` runs this FOR UPDATE in autocommit (postgres.js and Neon send each tagged query as its own transaction), so the row lock ends before ${fnName(lexed.code, fns.find((x) => x.bodyOpen >= 0))} acts on the rows. Wrap the SELECT and the writes in \`${tag}.begin(async (tx) => …)\`, or claim the rows in one \`UPDATE … WHERE id IN (SELECT … FOR UPDATE SKIP LOCKED) RETURNING *\`.`,
+    );
   }
 
   // Drizzle `.for('update')`, Knex `.forUpdate()`: query builders whose chain has to start on a transaction.
@@ -333,7 +355,10 @@ function checkPyLocks(rule: Rule, f: SourceFile, asyncpgProject: boolean, autoco
         continue;
       }
       if (autocommit) {
-        out.push(finding(rule, f, at, "The project turns on autocommit, so this FOR UPDATE outside `with conn.transaction():` is its own transaction and the lock ends with the statement."));
+        const params = def ? /\(([\s\S]*?)\)\s*(?:->[^:]+)?:\s*$/.exec(def.header)?.[1] ?? "" : "";
+        const base = call.receiver.split(".")[0]!;
+        if (base !== "self" && new RegExp(`\\b${escape(base)}\\b`).test(params)) continue; // the caller owns the connection and its transaction
+        out.push(finding(rule, f, at, "This connection comes from a module that turns on autocommit, so this FOR UPDATE outside `with conn.transaction():` is its own transaction and the lock ends with the statement."));
       }
     }
   }
@@ -344,6 +369,30 @@ function checkPyLocks(rule: Rule, f: SourceFile, asyncpgProject: boolean, autoco
     }
   }
   return out;
+}
+
+/**
+ * Autocommit turned on for the app's own connections. Scripts, and admin connections to the `postgres` maintenance
+ * database (opened in autocommit because CREATE DATABASE can't run in a transaction), don't say anything about how
+ * the app runs its queries.
+ */
+function appAutocommit(f: SourceFile): boolean {
+  if (/(^|\/)(scripts?|bin|tools|migrations?|alembic)\//.test(f.path) || /(^|\/)conftest\.py$/.test(f.path)) return false;
+  return f.text.split("\n").some((line) => PY_AUTOCOMMIT.test(line) && !/["'\/]postgres["']|create\s+database/i.test(line));
+}
+
+/**
+ * True when Python source `text` imports the module at `path` (`app/db.py` → `from app.db import …`, `from .db
+ * import …`, `import db`). Autocommit set in a module the locking code never imports (an evals or admin helper)
+ * says nothing about the connection that code uses.
+ */
+function importsModule(text: string, path: string): boolean {
+  const parts = path.replace(/\.py$/, "").replace(/\/__init__$/, "").split("/");
+  const stem = escape(parts[parts.length - 1]!);
+  const parent = parts.length > 1 ? escape(parts[parts.length - 2]!) : undefined;
+  const from = new RegExp(`^\\s*from\\s+(?:[\\w.]*\\.)?${stem}\\s+import\\b|^\\s*import\\s+(?:[\\w.]*\\.)?${stem}\\b`, "m");
+  const fromParent = parent ? new RegExp(`^\\s*from\\s+(?:[\\w.]*\\.)?${parent}\\s+import\\s+[^\\n]*\\b${stem}\\b`, "m") : undefined;
+  return from.test(text) || (fromParent?.test(text) ?? false);
 }
 
 const pythonDeps = (project: Project) =>
@@ -365,14 +414,21 @@ export const forUpdateAutocommit: Rule = {
     const py = project.files.filter((f) => f.kind === "python" && !isTestFile(f));
     if (py.length) {
       const asyncpg = /\basyncpg\b/i.test(pythonDeps(project));
-      const autocommit = py.some((f) => PY_AUTOCOMMIT.test(f.text));
-      out.push(...py.filter((f) => /\bfor\s+(?:no\s+key\s+)?(?:update|share)\b|with_for_update/i.test(f.text)).flatMap((f) => checkPyLocks(this, f, asyncpg, autocommit)));
+      const autocommitModules = py.filter(appAutocommit);
+      out.push(
+        ...py
+          .filter((f) => /\bfor\s+(?:no\s+key\s+)?(?:update|share)\b|with_for_update/i.test(f.text))
+          .flatMap((f) => checkPyLocks(this, f, asyncpg, autocommitModules.some((m) => m === f || importsModule(f.text, m.path)))),
+      );
     }
     return out;
   },
 };
 
 // ---- check-then-act ---------------------------------------------------------------------------------------------
+
+/** Seeds, migrations and one-off scripts run alone; a check-then-act there has nobody to race with. */
+const ONE_OFF_PATH = /(^|\/)(scripts?|seeds?|seeders|migrations?|alembic)\//;
 
 /** Columns whose value decides whether the request may proceed. */
 const GUARD_COLUMNS = /^(status|state|is_paid|paid|is_used|used|redeemed|is_redeemed|claimed|is_claimed|booked|is_booked|processed|is_processed|balance|credits|stock|quantity|qty|available|seats|seats_left|remaining)$/i;
@@ -429,7 +485,7 @@ export const checkThenAct: Rule = {
   check(project) {
     const out: Finding[] = [];
     for (const f of project.files) {
-      if ((f.kind !== "source" && f.kind !== "python") || isTestFile(f) || !/\bupdate\b/i.test(f.text)) continue;
+      if ((f.kind !== "source" && f.kind !== "python") || isTestFile(f) || ONE_OFF_PATH.test(f.path) || !/\bupdate\b/i.test(f.text)) continue;
       const lexed = f.kind === "source" ? lexJs(f.text) : lexPython(f.text);
       const region = (pos: number): [number, number] => {
         if (f.kind === "source") {
@@ -444,9 +500,17 @@ export const checkThenAct: Rule = {
         if (!upd || !upd.absolute.length) continue;
         const [from, to] = region(lit.start);
         if (/serializable/i.test(f.text.slice(from, to))) continue;
-        const reads = lexed.literals.filter((l) => l.start >= from && l.end <= lit.start).map((l) => parseRead(l.value)).filter((r) => r?.table === upd.table);
+        const before = lexed.literals.filter((l) => l.start >= from && l.end <= lit.start);
+        // A row this function inserted is invisible to other transactions until it commits: updating it isn't a race.
+        if (before.some((l) => new RegExp(`^\\s*insert\\s+into\\s+(?:"?\\w+"?\\.)?"?${upd.table}"?[\\s(][\\s\\S]*\\breturning\\b`, "i").test(l.value))) continue;
+        // The fix this rule suggests: the row was read with FOR UPDATE earlier in the same function (inside the transaction).
+        if (before.some((l) => lockingSelect(l.value) !== undefined && new RegExp(`\\bfrom\\s+(?:"?\\w+"?\\.)?"?${upd.table}"?\\b`, "i").test(l.value))) continue;
+        const reads = before.map((l) => parseRead(l.value)).filter((r) => r?.table === upd.table);
+        const raw = f.text.slice(lit.start, lit.end);
         for (const col of upd.absolute) {
           if (new RegExp(`\\b${col}\\b`, "i").test(upd.where)) continue;
+          // PATCH handlers: `status = ${body.status ?? existing.status}` writes back what the client sent; no decision is made on the read.
+          if (new RegExp(`\\b${col}"?\\s*=\\s*\\$\\{[^}]*(?:\\?\\?|\\|\\||\\.\\s*${col}\\b)`, "i").test(raw)) continue;
           if (!reads.some((r) => r!.columns === "*" || new RegExp(`\\b${col}\\b`).test(r!.columns))) continue;
           out.push(
             finding(

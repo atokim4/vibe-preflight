@@ -1883,13 +1883,15 @@ function jsCallFor(lexed, lit) {
 function projectHints(project, sources) {
   const pools = /* @__PURE__ */ new Set();
   const clients = /* @__PURE__ */ new Set();
+  const sqlTags = /* @__PURE__ */ new Set();
   for (const f of sources) {
+    for (const m of f.text.matchAll(/(?:const|let|var|export\s+const)\s+([A-Za-z_$][\w$]*)\s*(?::[^=]+)?=\s*(?:postgres|neon)\s*\(/g)) sqlTags.add(m[1]);
     for (const m of f.text.matchAll(/(?:const|let|var|export\s+const)\s+([A-Za-z_$][\w$]*)\s*(?::[^=]+)?=\s*(?:new\s+(?:pg\.|postgres\.)?Pool\b|(?:mysql\.)?createPool\s*\(|postgres\s*\()/g)) pools.add(m[1]);
     for (const m of f.text.matchAll(/(?:const|let|var|export\s+const)\s+([A-Za-z_$][\w$]*)\s*(?::[^=]+)?=\s*new\s+(?:pg\.)?Client\b/g)) clients.add(m[1]);
     for (const m of f.text.matchAll(/this\.(\w+)\s*=\s*new\s+(?:pg\.)?Pool\b/g)) pools.add(`this.${m[1]}`);
   }
   const pkg = project.files.filter((f) => f.path.endsWith("package.json")).map((f) => f.text).join("\n");
-  return { pools, clients, sequelize: /"sequelize"\s*:/.test(pkg) };
+  return { pools, clients, sqlTags, sequelize: /"sequelize"\s*:/.test(pkg) };
 }
 function beganOn(lexed, receiver, from, to) {
   return lexed.literals.some((l) => {
@@ -1947,6 +1949,20 @@ function checkJsLocks(rule, f, hints) {
       if (!localConn && (isParam(fns, base) || base === "this")) continue;
       report(at, `No BEGIN on \`${call.receiver}\` in ${where2}, so this FOR UPDATE runs in autocommit and the row lock ends with the statement. Send BEGIN first and COMMIT after the write, on the same client.`);
     }
+  }
+  const builderSql = /import\s*\{[^}]*\bsql\b[^}]*\}\s*from\s*["'](?:drizzle-orm[^"']*|kysely|slonik|@databases\/[^"']+)["']/.test(f.text);
+  for (const lit of lexed.literals) {
+    if (builderSql || f.text[lit.start] !== "`") continue;
+    const rel = lockingSelect(lit.value);
+    if (rel === void 0) continue;
+    const tag = /(?<![\w$.])([A-Za-z_$][\w$]*)\s*(?:<[^`;]*>)?\s*$/.exec(lexed.code.slice(Math.max(0, lit.start - 120), lit.start))?.[1];
+    if (!tag || !hints.sqlTags.has(tag) || insideTxCall(lexed, lit.start)) continue;
+    const fns = jsFunctionsAround(lexed, lit.start);
+    if (isParam(fns, tag)) continue;
+    report(
+      lit.start + 1 + rel,
+      `\`${tag}\`\u2026\`\` runs this FOR UPDATE in autocommit (postgres.js and Neon send each tagged query as its own transaction), so the row lock ends before ${fnName(lexed.code, fns.find((x) => x.bodyOpen >= 0))} acts on the rows. Wrap the SELECT and the writes in \`${tag}.begin(async (tx) => \u2026)\`, or claim the rows in one \`UPDATE \u2026 WHERE id IN (SELECT \u2026 FOR UPDATE SKIP LOCKED) RETURNING *\`.`
+    );
   }
   for (const m of f.text.matchAll(/\.\s*for\s*\(\s*(["'`])(?:no key update|update|key share|share)\1\s*\)/gi)) {
     if (/^\.\s*for\s*\(/.test(lexed.code.slice(m.index, m.index + 24))) checkChain(m.index, "drizzle");
@@ -2048,7 +2064,10 @@ function checkPyLocks(rule, f, asyncpgProject, autocommit) {
         continue;
       }
       if (autocommit) {
-        out.push(finding(rule, f, at, "The project turns on autocommit, so this FOR UPDATE outside `with conn.transaction():` is its own transaction and the lock ends with the statement."));
+        const params = def ? /\(([\s\S]*?)\)\s*(?:->[^:]+)?:\s*$/.exec(def.header)?.[1] ?? "" : "";
+        const base = call.receiver.split(".")[0];
+        if (base !== "self" && new RegExp(`\\b${escape(base)}\\b`).test(params)) continue;
+        out.push(finding(rule, f, at, "This connection comes from a module that turns on autocommit, so this FOR UPDATE outside `with conn.transaction():` is its own transaction and the lock ends with the statement."));
       }
     }
   }
@@ -2059,6 +2078,18 @@ function checkPyLocks(rule, f, asyncpgProject, autocommit) {
     }
   }
   return out;
+}
+function appAutocommit(f) {
+  if (/(^|\/)(scripts?|bin|tools|migrations?|alembic)\//.test(f.path) || /(^|\/)conftest\.py$/.test(f.path)) return false;
+  return f.text.split("\n").some((line) => PY_AUTOCOMMIT.test(line) && !/["'\/]postgres["']|create\s+database/i.test(line));
+}
+function importsModule(text2, path) {
+  const parts = path.replace(/\.py$/, "").replace(/\/__init__$/, "").split("/");
+  const stem = escape(parts[parts.length - 1]);
+  const parent = parts.length > 1 ? escape(parts[parts.length - 2]) : void 0;
+  const from = new RegExp(`^\\s*from\\s+(?:[\\w.]*\\.)?${stem}\\s+import\\b|^\\s*import\\s+(?:[\\w.]*\\.)?${stem}\\b`, "m");
+  const fromParent = parent ? new RegExp(`^\\s*from\\s+(?:[\\w.]*\\.)?${parent}\\s+import\\s+[^\\n]*\\b${stem}\\b`, "m") : void 0;
+  return from.test(text2) || (fromParent?.test(text2) ?? false);
 }
 var pythonDeps = (project) => project.files.filter((f) => /(^|\/)(requirements[^/]*\.txt|pyproject\.toml|Pipfile|setup\.cfg)$/.test(f.path)).map((f) => f.text).join("\n");
 var forUpdateAutocommit = {
@@ -2074,12 +2105,15 @@ var forUpdateAutocommit = {
     const py = project.files.filter((f) => f.kind === "python" && !isTestFile(f));
     if (py.length) {
       const asyncpg = /\basyncpg\b/i.test(pythonDeps(project));
-      const autocommit = py.some((f) => PY_AUTOCOMMIT.test(f.text));
-      out.push(...py.filter((f) => /\bfor\s+(?:no\s+key\s+)?(?:update|share)\b|with_for_update/i.test(f.text)).flatMap((f) => checkPyLocks(this, f, asyncpg, autocommit)));
+      const autocommitModules = py.filter(appAutocommit);
+      out.push(
+        ...py.filter((f) => /\bfor\s+(?:no\s+key\s+)?(?:update|share)\b|with_for_update/i.test(f.text)).flatMap((f) => checkPyLocks(this, f, asyncpg, autocommitModules.some((m) => m === f || importsModule(f.text, m.path))))
+      );
     }
     return out;
   }
 };
+var ONE_OFF_PATH = /(^|\/)(scripts?|seeds?|seeders|migrations?|alembic)\//;
 var GUARD_COLUMNS = /^(status|state|is_paid|paid|is_used|used|redeemed|is_redeemed|claimed|is_claimed|booked|is_booked|processed|is_processed|balance|credits|stock|quantity|qty|available|seats|seats_left|remaining)$/i;
 function parseUpdate(sql) {
   const m = /^\s*update\s+(?:only\s+)?(?:"?\w+"?\.)?"?(\w+)"?(?:\s+(?:as\s+)?\w+)?\s+set\s+([\s\S]+?)\s+where\s+([\s\S]+?)(?:\s+returning\b[\s\S]*)?;?\s*$/i.exec(sql);
@@ -2121,7 +2155,7 @@ var checkThenAct = {
   check(project) {
     const out = [];
     for (const f of project.files) {
-      if (f.kind !== "source" && f.kind !== "python" || isTestFile(f) || !/\bupdate\b/i.test(f.text)) continue;
+      if (f.kind !== "source" && f.kind !== "python" || isTestFile(f) || ONE_OFF_PATH.test(f.path) || !/\bupdate\b/i.test(f.text)) continue;
       const lexed = f.kind === "source" ? lexJs(f.text) : lexPython(f.text);
       const region = (pos) => {
         if (f.kind === "source") {
@@ -2136,9 +2170,14 @@ var checkThenAct = {
         if (!upd || !upd.absolute.length) continue;
         const [from, to] = region(lit.start);
         if (/serializable/i.test(f.text.slice(from, to))) continue;
-        const reads = lexed.literals.filter((l) => l.start >= from && l.end <= lit.start).map((l) => parseRead(l.value)).filter((r) => r?.table === upd.table);
+        const before = lexed.literals.filter((l) => l.start >= from && l.end <= lit.start);
+        if (before.some((l) => new RegExp(`^\\s*insert\\s+into\\s+(?:"?\\w+"?\\.)?"?${upd.table}"?[\\s(][\\s\\S]*\\breturning\\b`, "i").test(l.value))) continue;
+        if (before.some((l) => lockingSelect(l.value) !== void 0 && new RegExp(`\\bfrom\\s+(?:"?\\w+"?\\.)?"?${upd.table}"?\\b`, "i").test(l.value))) continue;
+        const reads = before.map((l) => parseRead(l.value)).filter((r) => r?.table === upd.table);
+        const raw = f.text.slice(lit.start, lit.end);
         for (const col of upd.absolute) {
           if (new RegExp(`\\b${col}\\b`, "i").test(upd.where)) continue;
+          if (new RegExp(`\\b${col}"?\\s*=\\s*\\$\\{[^}]*(?:\\?\\?|\\|\\||\\.\\s*${col}\\b)`, "i").test(raw)) continue;
           if (!reads.some((r) => r.columns === "*" || new RegExp(`\\b${col}\\b`).test(r.columns))) continue;
           out.push(
             finding(
@@ -2234,7 +2273,7 @@ function scan(root, skip = [], options = {}) {
 }
 
 // src/report.ts
-var VERSION = "1.7.0";
+var VERSION = "1.7.1";
 var plural = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
 function summary(r) {
   const c = counts(r.findings);
@@ -2308,7 +2347,7 @@ function rulesToSkip(include, exclude) {
 }
 
 // src/cli.ts
-var HELP = `vibe-preflight ${VERSION}: 19 pre-launch checks for Supabase + Stripe apps (Next.js, Vite, Expo, Hono\u2026)
+var HELP = `vibe-preflight ${VERSION}: 21 pre-launch checks for Supabase + Stripe apps (Next.js, Vite, Expo, Hono\u2026)
 
 Usage
   node preflight.mjs [dir]              scan a project (default: current directory)

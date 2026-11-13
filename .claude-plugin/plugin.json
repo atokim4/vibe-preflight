@@ -1,6 +1,6 @@
 {
   "name": "vibe-preflight",
-  "version": "1.7.0",
+  "version": "1.7.1",
   "description": "21 pre-launch checks for Supabase + Stripe apps (full scan, Supabase RLS audit, Stripe webhook review, Supabase breaking changes, Postgres row locks that end too early), with a zero-dependency Node scanner and fix steps, plus an Upwork proposal linter.",
   "author": { "name": "Sunnatulla" },
   "homepage": "https://github.com/atokim4/vibe-preflight",

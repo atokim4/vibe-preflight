@@ -36,6 +36,6 @@ describe("markdownSummary", () => {
   });
 
   it("says the checks passed when there is nothing to report", () => {
-    expect(markdownSummary(scan(join(EXAMPLES, "fixed-app")))).toBe("## vibe-preflight 1.7.0\n\nNo findings: 21 checks passed.\n");
+    expect(markdownSummary(scan(join(EXAMPLES, "fixed-app")))).toBe("## vibe-preflight 1.7.1\n\nNo findings: 21 checks passed.\n");
   });
 });

@@ -183,6 +183,11 @@ The `pool.query('BEGIN')` row is the dangerous one: it looks right and passes a 
 hands the same idle connection back. Under any other traffic the statements spread over connections. Running
 the scanner on the repro flags exactly the five broken strategies and none of the four correct ones.
 
+postgres.js and Neon are easy to miss here: a tagged `` sql`SELECT … FOR UPDATE SKIP LOCKED` `` looks like a job
+claim, but each tagged query is its own transaction, so the rows are unlocked by the time the loop sends the
+first message. Claim them in one statement (`UPDATE … WHERE id IN (SELECT … FOR UPDATE SKIP LOCKED) RETURNING *`)
+or inside `sql.begin(async (tx) => …)`.
+
 Two things need no check. Django raises `TransactionManagementError` when a `select_for_update()` queryset runs
 outside `transaction.atomic()` ([docs](https://docs.djangoproject.com/en/5.2/ref/models/querysets/#select-for-update)).
 Supabase `.rpc()` calls run inside one transaction per request ([PostgREST](https://docs.postgrest.org/en/stable/references/transactions.html)),
