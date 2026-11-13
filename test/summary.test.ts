@@ -9,7 +9,7 @@ const broken = () => scan(join(EXAMPLES, "broken-app"));
 describe("markdownSummary", () => {
   it("has a totals line, one table row per finding and the fix of each check that fired", () => {
     const md = markdownSummary(broken(), { pathPrefix: "examples/broken-app" });
-    expect(md).toContain("**5 errors, 4 warnings** in `examples/broken-app` (19 checks ran).");
+    expect(md).toContain("**5 errors, 4 warnings** in `examples/broken-app` (21 checks ran).");
     expect(md).toContain("| Severity | Check | Location | Finding |");
     expect(md.split("\n").filter((l) => /^\| (error|warning) \|/.test(l))).toHaveLength(9);
     expect(md).toContain("| error | `rls-disabled` | `examples/broken-app/supabase/migrations/20261101000000_init.sql:14` |");
@@ -36,6 +36,6 @@ describe("markdownSummary", () => {
   });
 
   it("says the checks passed when there is nothing to report", () => {
-    expect(markdownSummary(scan(join(EXAMPLES, "fixed-app")))).toBe("## vibe-preflight 1.6.1\n\nNo findings: 19 checks passed.\n");
+    expect(markdownSummary(scan(join(EXAMPLES, "fixed-app")))).toBe("## vibe-preflight 1.7.0\n\nNo findings: 21 checks passed.\n");
   });
 });

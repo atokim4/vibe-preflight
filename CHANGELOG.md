@@ -1,5 +1,27 @@
 # Changelog
 
+## 1.7.0 (2026-11-13)
+
+Two checks for races in Postgres code, in a new `concurrency` group (`--only concurrency`) and in the
+`vibe-preflight` skill. They run on any project, Supabase or not, and read Python files too (`.py`, plus
+`requirements*.txt` / `pyproject.toml` to spot asyncpg). Virtualenvs and Python caches are skipped.
+
+- `for-update-autocommit` (error): `SELECT … FOR UPDATE` / `FOR NO KEY UPDATE` / `FOR SHARE` whose lock ends
+  with the statement because no transaction holds it. node-postgres `pool.query` is always reported (each call
+  can take another connection, so a `BEGIN` sent through the pool doesn't help); a client from `connect()` is
+  reported when the function sends no `BEGIN` on it; a client passed in as a parameter is left alone. Also
+  Prisma `$queryRaw` / `$executeRaw` outside `$transaction(...)`, Drizzle `.for('update')` and Knex
+  `.forUpdate()` outside a transaction, Sequelize `lock` with no `transaction`, asyncpg outside
+  `conn.transaction()`, and psycopg / SQLAlchemy `with_for_update()` when the project turns autocommit on.
+  Locks inside an `UPDATE … WHERE id = (SELECT … FOR UPDATE SKIP LOCKED)` or a data-modifying CTE are fine and
+  not reported. Django `select_for_update()` (raises outside `atomic()`) and Supabase `.rpc()` (one transaction
+  per request) need no check.
+- `check-then-act` (warning): raw SQL in one function that reads a `status` / `balance` / `stock`-style column
+  and then sets it with an `UPDATE` whose `WHERE` doesn't re-check it.
+- `examples/for-update-repro`: two requests racing one order and one wallet on a real PostgreSQL 18 server
+  (embedded-postgres), 20 rounds per strategy, saved in `OUTPUT.txt`. The scanner flags exactly the five
+  broken strategies in it and none of the four correct ones.
+
 ## 1.6.1 (2026-11-10)
 
 No rule changes. The file-system and git code moved out of the scan engine (`src/model.ts` and

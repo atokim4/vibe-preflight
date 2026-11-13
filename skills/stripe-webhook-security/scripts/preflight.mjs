@@ -18,9 +18,11 @@ function fileKind(path) {
   const name = path.slice(slash + 1);
   const dir = slash === -1 ? "" : path.slice(0, slash);
   if (SOURCE_EXT.test(name) && !name.endsWith(".d.ts")) return "source";
+  if (name.endsWith(".py")) return "python";
   if (name.endsWith(".sql")) return "sql";
   if (ENV_FILE.test(name)) return "env";
   if (name === "package.json" || name === ".gitignore") return "other";
+  if (/^(requirements[^/]*\.txt|pyproject\.toml|Pipfile|setup\.cfg)$/.test(name)) return "other";
   if (name === "config.toml" && (dir === "supabase" || dir.endsWith("/supabase"))) return "other";
   return void 0;
 }
@@ -73,7 +75,15 @@ var SKIP_DIRS = /* @__PURE__ */ new Set([
   "vendor",
   ".pnpm-store",
   "playwright-report",
-  "test-results"
+  "test-results",
+  ".venv",
+  "venv",
+  "__pycache__",
+  "site-packages",
+  ".tox",
+  ".mypy_cache",
+  ".pytest_cache",
+  ".ruff_cache"
 ]);
 var MAX_FILE_BYTES = 1e6;
 var SELF = "preflight.mjs";
@@ -1634,6 +1644,518 @@ var cronJobDirectWrite = {
   }
 };
 
+// src/lexer.ts
+var blankRun = (s) => s.replace(/[^\n]/g, " ");
+function lexJs(src) {
+  const literals = [];
+  let code = "";
+  let i = 0;
+  while (i < src.length) {
+    const c = src[i];
+    const n = src[i + 1];
+    if (c === "/" && (n === "/" || n === "*")) {
+      const end = n === "/" ? src.indexOf("\n", i) : src.indexOf("*/", i + 2);
+      const stop = end === -1 ? src.length : n === "/" ? end : end + 2;
+      code += blankRun(src.slice(i, stop));
+      i = stop;
+    } else if (c === '"' || c === "'" || c === "`") {
+      let j = i + 1;
+      let value = "";
+      while (j < src.length && src[j] !== c) {
+        if (src[j] === "\\") {
+          value += src.slice(j, j + 2);
+          j += 2;
+          continue;
+        }
+        if (c !== "`" && src[j] === "\n") break;
+        if (c === "`" && src[j] === "$" && src[j + 1] === "{") {
+          let depth = 0;
+          let k = j + 1;
+          for (; k < src.length; k++) {
+            if (src[k] === "{") depth++;
+            else if (src[k] === "}" && --depth === 0) break;
+          }
+          value += "$1";
+          j = k + 1;
+          continue;
+        }
+        value += src[j];
+        j++;
+      }
+      const end = Math.min(j + 1, src.length);
+      literals.push({ start: i, end, value });
+      code += c + blankRun(src.slice(i + 1, end - 1)) + (end - 1 > i ? src[end - 1] : "");
+      i = end;
+    } else {
+      code += c;
+      i++;
+    }
+  }
+  return { literals, code, pairs: bracketPairs(code) };
+}
+function lexPython(src) {
+  const literals = [];
+  let code = "";
+  let i = 0;
+  while (i < src.length) {
+    const c = src[i];
+    if (c === "#") {
+      const nl = src.indexOf("\n", i);
+      const stop = nl === -1 ? src.length : nl;
+      code += blankRun(src.slice(i, stop));
+      i = stop;
+      continue;
+    }
+    const prefix = /^[rRbBfFuU]{0,2}(?='|")/.exec(src.slice(i, i + 3));
+    const prevIsWord = i > 0 && /[\w]/.test(src[i - 1]);
+    if (prefix && !(prefix[0] && prevIsWord)) {
+      const q = i + prefix[0].length;
+      const quote = src[q];
+      const triple = src.slice(q, q + 3) === quote.repeat(3);
+      const delim = triple ? quote.repeat(3) : quote;
+      let j = q + delim.length;
+      while (j < src.length && !src.startsWith(delim, j)) {
+        if (src[j] === "\\") j++;
+        else if (!triple && src[j] === "\n") break;
+        j++;
+      }
+      const end = Math.min(j + delim.length, src.length);
+      literals.push({ start: i, end, value: src.slice(q + delim.length, j) });
+      code += src.slice(i, q + delim.length) + blankRun(src.slice(q + delim.length, j)) + src.slice(j, end);
+      i = end;
+      continue;
+    }
+    code += c;
+    i++;
+  }
+  return { literals, code, pairs: bracketPairs(code) };
+}
+function bracketPairs(code) {
+  const pairs = [];
+  const stack = [];
+  const closer = { ")": "(", "}": "{", "]": "[" };
+  for (let i = 0; i < code.length; i++) {
+    const c = code[i];
+    if (c === "(" || c === "{" || c === "[") stack.push({ at: i, char: c });
+    else if (c in closer) {
+      const k = stack.map((s) => s.char).lastIndexOf(closer[c]);
+      if (k === -1) continue;
+      const top = stack[k];
+      stack.length = k;
+      pairs.push({ open: top.at, close: i, char: top.char });
+    }
+  }
+  return pairs.sort((a, b) => a.open - b.open);
+}
+function enclosing(lexed, pos) {
+  return lexed.pairs.filter((p) => p.open < pos && p.close >= pos).sort((a, b) => b.open - a.open);
+}
+function calleeBefore(code, pos) {
+  const head = code.slice(Math.max(0, pos - 200), pos).replace(/<[^<>()]*>\s*$/, "");
+  return /([A-Za-z_$][\w$]*(?:\s*\??\.\s*[A-Za-z_$][\w$]*)*)\s*$/.exec(head)?.[1]?.replace(/\s+|\?/g, "");
+}
+function splitCallee(callee) {
+  const dot = callee.lastIndexOf(".");
+  if (dot <= 0) return void 0;
+  return { receiver: callee.slice(0, dot), method: callee.slice(dot + 1) };
+}
+function indentAt(src, pos) {
+  const lineStart = src.lastIndexOf("\n", pos - 1) + 1;
+  return { indent: /^[ \t]*/.exec(src.slice(lineStart))[0].length, lineStart };
+}
+function pyBlocksAround(src, code, pos) {
+  const out = [];
+  let { indent, lineStart } = indentAt(code, pos);
+  let cursor = lineStart;
+  while (cursor > 0 && indent > 0) {
+    const prevEnd = cursor - 1;
+    const prevStart = code.lastIndexOf("\n", prevEnd - 1) + 1;
+    const line = code.slice(prevStart, prevEnd);
+    cursor = prevStart;
+    if (!line.trim()) continue;
+    const ind = /^[ \t]*/.exec(line)[0].length;
+    if (ind < indent && /:\s*$/.test(line.trimEnd())) {
+      out.push({ header: src.slice(prevStart, prevEnd).trim(), start: prevStart, indent: ind });
+      indent = ind;
+    } else if (ind < indent) {
+      continue;
+    }
+  }
+  return out;
+}
+function pyBlockText(code, block) {
+  const lines = code.slice(block.start).split("\n");
+  const body = [lines[0]];
+  for (const line of lines.slice(1)) {
+    if (line.trim() && /^[ \t]*/.exec(line)[0].length <= block.indent && !/^[ \t]*[)\]}]/.test(line)) break;
+    body.push(line);
+  }
+  return body.join("\n");
+}
+
+// src/rules/locking.ts
+var LOCKING_DOC = "https://www.postgresql.org/docs/current/explicit-locking.html#LOCKING-ROWS";
+var PG_TX_DOC = "https://node-postgres.com/features/transactions";
+var LOCK_CLAUSE = /\bfor\s+(?:no\s+key\s+update|update|key\s+share|share)\b/i;
+var LOCK_CLAUSE_G = /\bfor\s+(?:no\s+key\s+update|update|key\s+share|share)\b/gi;
+function lockingSelect(sql) {
+  const s = sql.trimStart();
+  const lead = sql.length - s.length;
+  if (!/^\(?\s*(select|with)\b/i.test(s) || !/\bfrom\b/i.test(s)) return void 0;
+  const m = LOCK_CLAUSE.exec(s);
+  if (!m) return void 0;
+  if (/^with\b/i.test(s) && /\b(?:update\s+[\w"]|delete\s+from\b|insert\s+into\b|merge\s+into\b)/i.test(s.replace(LOCK_CLAUSE_G, ""))) return void 0;
+  return lead + m.index;
+}
+var JS_DB_METHODS = /* @__PURE__ */ new Set([
+  "query",
+  "execute",
+  "unsafe",
+  "raw",
+  "one",
+  "oneOrNone",
+  "many",
+  "manyOrNone",
+  "any",
+  "none",
+  "result",
+  "$queryRaw",
+  "$queryRawUnsafe",
+  "$executeRaw",
+  "$executeRawUnsafe"
+]);
+var PRISMA_METHODS = /^\$(query|execute)Raw(Unsafe)?$/;
+var TX_CALLEE = /(?:^|\.)(?:\$transaction|transaction|begin|tx|txIf|withTransaction|inTransaction|runInTransaction|serializable)$/i;
+var CONTROL = /\b(if|for|while|switch|catch|with|return|typeof|await)\s*$/;
+function jsFunctionsAround(lexed, pos) {
+  const out = [];
+  const { code } = lexed;
+  for (const p of enclosing(lexed, pos)) {
+    if (p.char !== "{") continue;
+    const before = code.slice(0, p.open).trimEnd();
+    if (before.endsWith("=>")) {
+      const head = before.slice(0, -2).trimEnd();
+      const params = head.endsWith(")") ? pairText(lexed, head.length - 1) : /([A-Za-z_$][\w$]*)$/.exec(head)?.[1] ?? "";
+      out.push({ bodyOpen: p.open, bodyClose: p.close, params });
+      continue;
+    }
+    const sig = /\)\s*(?::\s*[^{};=]*(?:\{[^{}]*\}[^{};=]*)?)?$/.exec(before);
+    if (!sig) continue;
+    const close = before.length - sig[0].length;
+    const open = lexed.pairs.find((q) => q.close === close && q.char === "(");
+    if (!open || CONTROL.test(code.slice(0, open.open))) continue;
+    out.push({ bodyOpen: p.open, bodyClose: p.close, params: code.slice(open.open + 1, close) });
+  }
+  const lineStart = code.lastIndexOf("\n", pos) + 1;
+  for (const m of code.slice(Math.max(0, lineStart - 400), pos).matchAll(/\(([^()]*)\)\s*=>|([A-Za-z_$][\w$]*)\s*=>/g)) {
+    out.push({ bodyOpen: -1, bodyClose: -1, params: m[1] ?? m[2] ?? "" });
+  }
+  return out;
+}
+function pairText(lexed, close) {
+  const open = lexed.pairs.find((q) => q.close === close);
+  return open ? lexed.code.slice(open.open + 1, close) : "";
+}
+var isParam = (fns, name) => fns.some((f) => new RegExp(`(?<![\\w$.])${escape(name)}(?![\\w$])`).test(f.params));
+var escape = (s) => s.replace(/[.*+?^${}()|[\]\\$]/g, "\\$&");
+var baseName = (receiver) => receiver.startsWith("this.") ? receiver.split(".").slice(0, 2).join(".") : receiver.split(".")[0];
+function insideTxCall(lexed, pos) {
+  return enclosing(lexed, pos).some((p) => p.char === "(" && TX_CALLEE.test(calleeBefore(lexed.code, p.open) ?? ""));
+}
+function jsCallFor(lexed, lit) {
+  const tag = calleeBefore(lexed.code, lit.start);
+  const direct = tag && lexed.code.slice(0, lit.start).trimEnd().endsWith(tag.split(".").pop()) ? splitCallee(tag) : void 0;
+  if (direct && JS_DB_METHODS.has(direct.method)) return [{ at: lit.start, ...direct }];
+  const parens = enclosing(lexed, lit.start).filter((p) => p.char === "(").slice(0, 2);
+  for (const p of parens) {
+    const c = splitCallee(calleeBefore(lexed.code, p.open) ?? "");
+    if (c && JS_DB_METHODS.has(c.method)) return [{ at: p.open, ...c }];
+  }
+  const decl = /(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*(?::[^=]+)?=\s*(?:[A-Za-z_$][\w$.]*\s*)?$/.exec(lexed.code.slice(Math.max(0, lit.start - 160), lit.start));
+  if (!decl) return [];
+  const sites = [];
+  for (const m of lexed.code.matchAll(new RegExp(`([A-Za-z_$][\\w$.]*)\\s*\\(\\s*(?:\\{\\s*text\\s*:\\s*)?${escape(decl[1])}(?![\\w$])`, "g"))) {
+    const c = splitCallee(m[1]);
+    if (c && JS_DB_METHODS.has(c.method)) sites.push({ at: m.index + m[1].length, ...c });
+  }
+  return sites;
+}
+function projectHints(project, sources) {
+  const pools = /* @__PURE__ */ new Set();
+  const clients = /* @__PURE__ */ new Set();
+  for (const f of sources) {
+    for (const m of f.text.matchAll(/(?:const|let|var|export\s+const)\s+([A-Za-z_$][\w$]*)\s*(?::[^=]+)?=\s*(?:new\s+(?:pg\.|postgres\.)?Pool\b|(?:mysql\.)?createPool\s*\(|postgres\s*\()/g)) pools.add(m[1]);
+    for (const m of f.text.matchAll(/(?:const|let|var|export\s+const)\s+([A-Za-z_$][\w$]*)\s*(?::[^=]+)?=\s*new\s+(?:pg\.)?Client\b/g)) clients.add(m[1]);
+    for (const m of f.text.matchAll(/this\.(\w+)\s*=\s*new\s+(?:pg\.)?Pool\b/g)) pools.add(`this.${m[1]}`);
+  }
+  const pkg = project.files.filter((f) => f.path.endsWith("package.json")).map((f) => f.text).join("\n");
+  return { pools, clients, sequelize: /"sequelize"\s*:/.test(pkg) };
+}
+function beganOn(lexed, receiver, from, to) {
+  return lexed.literals.some((l) => {
+    if (l.start < from || l.end > to || !/^\s*(begin|start\s+transaction)\b/i.test(l.value)) return false;
+    return jsCallFor(lexed, l).some((c) => c.receiver === receiver);
+  });
+}
+function finding(rule, f, offset, message, severity = rule.severity) {
+  return { rule: rule.id, severity, message, file: f.path, line: lineAt(f.text, offset) };
+}
+var fnName = (code, fn) => {
+  if (!fn || fn.bodyOpen < 0) return "this file";
+  const head = code.slice(Math.max(0, fn.bodyOpen - 300), fn.bodyOpen);
+  const m = /(?:function\s*\*?\s*([A-Za-z_$][\w$]*)|(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?(?:function\b[^(]*)?\([^()]*\)[^=]*=>\s*$|([A-Za-z_$][\w$]*)\s*\([^()]*\)\s*(?::[^{]*)?$)/.exec(head);
+  const name = m?.[1] ?? m?.[2] ?? m?.[3];
+  return name && !/^(if|for|while|switch|catch)$/.test(name) ? `\`${name}\`` : "this function";
+};
+function checkJsLocks(rule, f, hints) {
+  const lexed = lexJs(f.text);
+  const out = [];
+  const seen = /* @__PURE__ */ new Set();
+  const report = (offset, message) => {
+    if (seen.has(offset)) return;
+    seen.add(offset);
+    out.push(finding(rule, f, offset, message));
+  };
+  for (const lit of lexed.literals) {
+    const rel = lockingSelect(lit.value);
+    if (rel === void 0) continue;
+    const at = lit.start + 1 + rel;
+    for (const call of jsCallFor(lexed, lit)) {
+      if (insideTxCall(lexed, call.at)) continue;
+      const fns = jsFunctionsAround(lexed, call.at);
+      const fn = fns.find((x) => x.bodyOpen >= 0);
+      const [from, to] = fn ? [fn.bodyOpen, fn.bodyClose] : [0, f.text.length];
+      const base = baseName(call.receiver);
+      const body = lexed.code.slice(from, to);
+      const where2 = fnName(lexed.code, fn);
+      if (PRISMA_METHODS.test(call.method)) {
+        if (isParam(fns, base)) continue;
+        report(at, `\`${call.receiver}.${call.method}\` runs this FOR UPDATE outside \`$transaction(async (tx) => \u2026)\`, so the row lock ends with the statement and a second request reads the same row unlocked.`);
+        continue;
+      }
+      const localConn = new RegExp(`(?<![\\w$.])${escape(base)}\\s*=\\s*(?:await\\s+)?(?:[\\w$.]+\\.(?:connect|acquire|getConnection|reserve)\\s*\\(|new\\s+(?:pg\\.)?Client\\b)`).test(body);
+      const pool = !localConn && (/pool/i.test(call.receiver) || hints.pools.has(base));
+      const began = beganOn(lexed, call.receiver, from, to);
+      if (pool) {
+        report(
+          at,
+          began ? `\`${call.receiver}.query('BEGIN')\` and this FOR UPDATE can run on different pooled connections, so the lock may sit outside the transaction (or in one left open). Take one client with \`await ${call.receiver}.connect()\` and send BEGIN, the SELECT, the UPDATE and COMMIT on it.` : `\`${call.receiver}.${call.method}\` runs this FOR UPDATE on a pooled connection in autocommit: the row lock ends with the statement, before ${where2} writes. Use one client from \`${call.receiver}.connect()\` inside BEGIN \u2026 COMMIT, or a single \`UPDATE \u2026 WHERE \u2026 RETURNING\`.`
+        );
+        continue;
+      }
+      if (began) continue;
+      if (!localConn && (isParam(fns, base) || base === "this")) continue;
+      report(at, `No BEGIN on \`${call.receiver}\` in ${where2}, so this FOR UPDATE runs in autocommit and the row lock ends with the statement. Send BEGIN first and COMMIT after the write, on the same client.`);
+    }
+  }
+  for (const m of f.text.matchAll(/\.\s*for\s*\(\s*(["'`])(?:no key update|update|key share|share)\1\s*\)/gi)) {
+    if (/^\.\s*for\s*\(/.test(lexed.code.slice(m.index, m.index + 24))) checkChain(m.index, "drizzle");
+  }
+  for (const m of lexed.code.matchAll(/\.\s*(forUpdate|forShare|forNoKeyUpdate|forKeyShare)\s*\(/g)) checkChain(m.index, "knex", m[1]);
+  function checkChain(pos, kind, method) {
+    if (insideTxCall(lexed, pos)) return;
+    const chain = chainAt(lexed.code, pos);
+    if (/\.\s*transacting\s*\(/.test(chain.text)) return;
+    const root = chain.root;
+    if (!root) return;
+    const fns = jsFunctionsAround(lexed, pos);
+    if (isParam(fns, root) || root === "this") return;
+    const fn = fns.find((x) => x.bodyOpen >= 0);
+    const body = lexed.code.slice(fn ? fn.bodyOpen : 0, fn ? fn.bodyClose : f.text.length);
+    if (new RegExp(`(?<![\\w$.])${escape(root)}\\s*=\\s*(?:await\\s+)?[\\w$.]+\\.transaction\\s*\\(`).test(body)) return;
+    report(
+      pos,
+      kind === "drizzle" ? `\`.for('update')\` on \`${root}\` outside \`${root}.transaction(async (tx) => \u2026)\`: the query runs in autocommit and the lock ends with it. Build it on \`tx\` inside the transaction callback.` : `\`.${method}()\` on \`${root}\` without \`.transacting(trx)\` or \`knex.transaction(async (trx) => \u2026)\`: the lock ends with the statement.`
+    );
+  }
+  if (hints.sequelize || /sequelize/i.test(f.text)) {
+    for (const m of lexed.code.matchAll(/\block\s*:\s*(?:true\b|[\w$.]*LOCK\.(?:UPDATE|SHARE|KEY_SHARE|NO_KEY_UPDATE)\b)/g)) {
+      const obj = enclosing(lexed, m.index).find((p) => p.char === "{");
+      if (!obj || /\btransaction\b/.test(lexed.code.slice(obj.open, obj.close)) || insideTxCall(lexed, m.index)) continue;
+      report(m.index, "`lock` without a `transaction` option: Sequelize sends SELECT \u2026 FOR UPDATE in autocommit, so the lock ends with the query. Pass `{ transaction: t, lock: t.LOCK.UPDATE }` inside `sequelize.transaction(async (t) => \u2026)`.");
+    }
+  }
+  return out;
+}
+function chainAt(code, pos) {
+  let start = pos;
+  let depth = 0;
+  for (; start > 0; start--) {
+    const c = code[start - 1];
+    if (c === ")" || c === "]" || c === "}") depth++;
+    else if (c === "(" || c === "[" || c === "{") {
+      if (depth === 0) break;
+      depth--;
+    } else if (depth === 0 && (c === ";" || c === "," || c === "=")) break;
+  }
+  let end = pos;
+  depth = 0;
+  for (; end < code.length; end++) {
+    const c = code[end];
+    if (c === "(" || c === "[" || c === "{") depth++;
+    else if (c === ")" || c === "]" || c === "}") {
+      if (depth === 0) break;
+      depth--;
+    } else if (depth === 0 && (c === ";" || c === ",")) break;
+  }
+  const text2 = code.slice(start, end);
+  const root = /^\s*(?:return\s+|await\s+|yield\s+)*([A-Za-z_$][\w$]*)/.exec(text2)?.[1];
+  return { text: text2, root: root && !/^(await|return|new|const|let)$/.test(root) ? root : void 0 };
+}
+var PY_DB_METHODS = /* @__PURE__ */ new Set(["execute", "executemany", "fetch", "fetchrow", "fetchval", "fetchone", "fetchall", "run_sync"]);
+var PY_TX_BLOCK = /^(?:async\s+)?with\b.*\.(?:transaction|begin|begin_nested|atomic)\s*\(|^(?:async\s+)?with\b.*\batomic\b/;
+var PY_AUTOCOMMIT = /\bautocommit\s*=\s*True\b|set_autocommit\s*\(\s*True|isolation_level\s*=\s*["']AUTOCOMMIT["']|ISOLATION_LEVEL_AUTOCOMMIT/;
+var OTHER_PY_DRIVER = /^\s*(?:import|from)\s+(?:psycopg2?|sqlalchemy|aiopg|databases|django|tortoise|peewee|pymysql|aiomysql|sqlite3|aiosqlite)\b/m;
+function pyCallFor(lexed, lit) {
+  for (const p of enclosing(lexed, lit.start).filter((q) => q.char === "(").slice(0, 2)) {
+    const c = splitCallee(calleeBefore(lexed.code, p.open) ?? "");
+    if (c && PY_DB_METHODS.has(c.method)) return [{ at: p.open, ...c }];
+  }
+  const decl = /(?:^|\n)[ \t]*([A-Za-z_][\w]*)\s*(?::[^=\n]+)?=\s*(?:\(\s*)?$/.exec(lexed.code.slice(Math.max(0, lit.start - 120), lit.start));
+  if (!decl) return [];
+  const sites = [];
+  for (const m of lexed.code.matchAll(new RegExp(`([A-Za-z_][\\w.]*)\\s*\\(\\s*(?:text\\s*\\(\\s*)?${escape(decl[1])}\\b`, "g"))) {
+    const c = splitCallee(m[1]);
+    if (c && PY_DB_METHODS.has(c.method)) sites.push({ at: m.index + m[1].length, ...c });
+  }
+  return sites;
+}
+var pyDef = (blocks) => blocks.find((b) => /^(?:async\s+)?def\b/.test(b.header));
+var pyInTx = (blocks) => blocks.some((b) => PY_TX_BLOCK.test(b.header));
+function checkPyLocks(rule, f, asyncpgProject, autocommit) {
+  const lexed = lexPython(f.text);
+  const out = [];
+  const asyncpg = /^\s*(?:import|from)\s+asyncpg\b/m.test(f.text) || asyncpgProject && !OTHER_PY_DRIVER.test(f.text);
+  for (const lit of lexed.literals) {
+    const rel = lockingSelect(lit.value);
+    if (rel === void 0) continue;
+    const at = f.text.indexOf(lit.value, lit.start) + rel;
+    for (const call of pyCallFor(lexed, lit)) {
+      const blocks = pyBlocksAround(f.text, lexed.code, call.at);
+      if (pyInTx(blocks)) continue;
+      const def = pyDef(blocks);
+      const defText = def ? pyBlockText(lexed.code, def) : lexed.code;
+      if (asyncpg) {
+        const base = call.receiver.startsWith("self.") ? call.receiver : call.receiver.split(".")[0];
+        if (/pool/i.test(call.receiver)) {
+          out.push(finding(rule, f, at, `\`${call.receiver}.${call.method}\` takes a connection for this one statement: asyncpg runs it in autocommit, so the FOR UPDATE lock ends before the write. Use \`async with ${call.receiver}.acquire() as conn, conn.transaction():\` around the SELECT and the UPDATE.`));
+          continue;
+        }
+        if (new RegExp(`\\b${escape(base)}\\.transaction\\s*\\(`).test(defText)) continue;
+        const params = def ? /\(([\s\S]*?)\)\s*(?:->[^:]+)?:\s*$/.exec(def.header)?.[1] ?? "" : "";
+        if (new RegExp(`\\b${escape(base.replace(/^self\./, ""))}\\b`).test(params) && !base.startsWith("self.")) continue;
+        out.push(finding(rule, f, at, `asyncpg is in autocommit unless you open \`async with ${call.receiver}.transaction():\`, so this FOR UPDATE releases its lock as soon as the row comes back.`));
+        continue;
+      }
+      if (autocommit) {
+        out.push(finding(rule, f, at, "The project turns on autocommit, so this FOR UPDATE outside `with conn.transaction():` is its own transaction and the lock ends with the statement."));
+      }
+    }
+  }
+  if (autocommit && /\bsqlalchemy\b/.test(f.text)) {
+    for (const m of lexed.code.matchAll(/\.with_for_update\s*\(/g)) {
+      if (pyInTx(pyBlocksAround(f.text, lexed.code, m.index)) && !/AUTOCOMMIT/.test(f.text)) continue;
+      out.push(finding(rule, f, m.index, '`with_for_update()` on an engine with AUTOCOMMIT isolation: every statement commits by itself, so the lock ends with the SELECT. Use the default isolation for this session (`engine.execution_options(isolation_level="READ COMMITTED")`) and `with session.begin():`.'));
+    }
+  }
+  return out;
+}
+var pythonDeps = (project) => project.files.filter((f) => /(^|\/)(requirements[^/]*\.txt|pyproject\.toml|Pipfile|setup\.cfg)$/.test(f.path)).map((f) => f.text).join("\n");
+var forUpdateAutocommit = {
+  id: "for-update-autocommit",
+  severity: "error",
+  title: "SELECT \u2026 FOR UPDATE outside a transaction",
+  why: "A row lock lasts until the transaction ends. In autocommit each statement is its own transaction, so the lock is gone before the code writes, and two requests (a double tap, a webhook retry) both see 'pending' and both book, pay or award. `pool.query` is always its own connection, so a BEGIN sent through it doesn't help.",
+  fix: `Run the SELECT \u2026 FOR UPDATE and the write in one transaction on one connection: node-postgres \`const c = await pool.connect()\` + BEGIN/COMMIT on \`c\` (${PG_TX_DOC}), \`prisma.$transaction(async (tx) => \u2026)\`, \`db.transaction(async (tx) => \u2026)\` (Drizzle), \`knex.transaction\`, \`async with conn.transaction():\` (asyncpg / psycopg). Often simpler: one \`UPDATE \u2026 SET status = 'paid' WHERE id = $1 AND status = 'pending' RETURNING id\` and check the row count. Row locks: ${LOCKING_DOC}. Django's select_for_update() outside atomic() and Supabase .rpc() (one transaction per request) are already safe.`,
+  check(project) {
+    const sources = project.files.filter((f) => f.kind === "source" && !isTestFile(f));
+    const hints = projectHints(project, sources);
+    const out = sources.filter((f) => /\bfor\s+(?:no\s+key\s+)?(?:update|share)\b|\.for\s*\(|\.for(?:Update|Share|NoKeyUpdate|KeyShare)\s*\(|\block\s*:/i.test(f.text)).flatMap((f) => checkJsLocks(this, f, hints));
+    const py = project.files.filter((f) => f.kind === "python" && !isTestFile(f));
+    if (py.length) {
+      const asyncpg = /\basyncpg\b/i.test(pythonDeps(project));
+      const autocommit = py.some((f) => PY_AUTOCOMMIT.test(f.text));
+      out.push(...py.filter((f) => /\bfor\s+(?:no\s+key\s+)?(?:update|share)\b|with_for_update/i.test(f.text)).flatMap((f) => checkPyLocks(this, f, asyncpg, autocommit)));
+    }
+    return out;
+  }
+};
+var GUARD_COLUMNS = /^(status|state|is_paid|paid|is_used|used|redeemed|is_redeemed|claimed|is_claimed|booked|is_booked|processed|is_processed|balance|credits|stock|quantity|qty|available|seats|seats_left|remaining)$/i;
+function parseUpdate(sql) {
+  const m = /^\s*update\s+(?:only\s+)?(?:"?\w+"?\.)?"?(\w+)"?(?:\s+(?:as\s+)?\w+)?\s+set\s+([\s\S]+?)\s+where\s+([\s\S]+?)(?:\s+returning\b[\s\S]*)?;?\s*$/i.exec(sql);
+  if (!m) return void 0;
+  const absolute = [];
+  for (const part of splitTop(m[2])) {
+    const a = /^\s*"?(\w+)"?\s*=\s*([\s\S]+)$/.exec(part);
+    if (!a || !GUARD_COLUMNS.test(a[1])) continue;
+    if (new RegExp(`\\b${a[1]}\\b`, "i").test(a[2])) continue;
+    absolute.push(a[1].toLowerCase());
+  }
+  return { table: m[1].toLowerCase(), absolute, where: m[3] };
+}
+function splitTop(s) {
+  const parts = [];
+  let depth = 0;
+  let cur = "";
+  for (const c of s) {
+    if (c === "(") depth++;
+    else if (c === ")") depth--;
+    if (c === "," && depth === 0) {
+      parts.push(cur);
+      cur = "";
+    } else cur += c;
+  }
+  return [...parts, cur];
+}
+function parseRead(sql) {
+  if (LOCK_CLAUSE.test(sql)) return void 0;
+  const m = /^\s*select\s+([\s\S]+?)\s+from\s+(?:"?\w+"?\.)?"?(\w+)"?/i.exec(sql);
+  return m ? { columns: m[1].toLowerCase(), table: m[2].toLowerCase() } : void 0;
+}
+var checkThenAct = {
+  id: "check-then-act",
+  severity: "warning",
+  title: "Status read, then updated without re-checking it",
+  why: "The code reads a status or balance, decides in JS/Python, then runs `UPDATE \u2026 WHERE id = $1`. Two requests at the same time both read 'pending' (or 100), both pass, and the order is paid twice or the wallet goes negative. A transaction alone doesn't stop it at READ COMMITTED.",
+  fix: `Put the check into the write: \`UPDATE orders SET status = 'paid' WHERE id = $1 AND status = 'pending' RETURNING id\` and treat zero rows as "already done", or \`SET balance = balance - $2 WHERE id = $1 AND balance >= $2\`. Or read with SELECT \u2026 FOR UPDATE inside the transaction that writes. ${LOCKING_DOC}`,
+  check(project) {
+    const out = [];
+    for (const f of project.files) {
+      if (f.kind !== "source" && f.kind !== "python" || isTestFile(f) || !/\bupdate\b/i.test(f.text)) continue;
+      const lexed = f.kind === "source" ? lexJs(f.text) : lexPython(f.text);
+      const region = (pos) => {
+        if (f.kind === "source") {
+          const fn = jsFunctionsAround(lexed, pos).find((x) => x.bodyOpen >= 0);
+          return fn ? [fn.bodyOpen, fn.bodyClose] : [0, f.text.length];
+        }
+        const def = pyDef(pyBlocksAround(f.text, lexed.code, pos));
+        return def ? [def.start, def.start + pyBlockText(lexed.code, def).length] : [0, f.text.length];
+      };
+      for (const lit of lexed.literals) {
+        const upd = parseUpdate(lit.value);
+        if (!upd || !upd.absolute.length) continue;
+        const [from, to] = region(lit.start);
+        if (/serializable/i.test(f.text.slice(from, to))) continue;
+        const reads = lexed.literals.filter((l) => l.start >= from && l.end <= lit.start).map((l) => parseRead(l.value)).filter((r) => r?.table === upd.table);
+        for (const col of upd.absolute) {
+          if (new RegExp(`\\b${col}\\b`, "i").test(upd.where)) continue;
+          if (!reads.some((r) => r.columns === "*" || new RegExp(`\\b${col}\\b`).test(r.columns))) continue;
+          out.push(
+            finding(
+              this,
+              f,
+              lit.start,
+              `Reads \`${col}\` from \`${upd.table}\` and then sets it with an UPDATE whose WHERE doesn't check \`${col}\`: two concurrent requests both pass the check. Add \`AND ${col} = <expected>\` to the WHERE and act only when a row comes back.`
+            )
+          );
+          break;
+        }
+      }
+    }
+    return out;
+  }
+};
+
 // src/rules/index.ts
 var allRules = [
   rlsDisabled,
@@ -1654,14 +2176,18 @@ var allRules = [
   webhookParsedBody,
   envFileCommitted,
   serverAdapterRemoved,
-  cronJobDirectWrite
+  cronJobDirectWrite,
+  forUpdateAutocommit,
+  checkThenAct
 ];
 var ruleGroups = {
   database: [rlsDisabled, rlsPermissivePolicy, rlsNoPolicy, rlsUpdatePrivilegedColumn, viewBypassesRls, authUsersExposed, definerSearchPath, definerFunctionAnon, storagePublicBucket, grantLeak, grantsMissing, grantBroad].map((r) => r.id),
   secrets: [serverSecretInClient, publicEnvSecret, envFileCommitted].map((r) => r.id),
   stripe: [webhookUnverified, webhookParsedBody].map((r) => r.id),
   /** Supabase breaking changes that make code or migrations fail after an upgrade or a cutoff date. */
-  breaking: [serverAdapterRemoved, cronJobDirectWrite].map((r) => r.id)
+  breaking: [serverAdapterRemoved, cronJobDirectWrite].map((r) => r.id),
+  /** Races where two requests both pass a check: row locks that end too early, status checks outside the write. */
+  concurrency: [forUpdateAutocommit, checkThenAct].map((r) => r.id)
 };
 
 // src/engine.ts
@@ -1708,7 +2234,7 @@ function scan(root, skip = [], options = {}) {
 }
 
 // src/report.ts
-var VERSION = "1.6.1";
+var VERSION = "1.7.0";
 var plural = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
 function summary(r) {
   const c = counts(r.findings);
@@ -1736,7 +2262,9 @@ function text(r, color, explain) {
   const tag = { error: c("31;1", "error  "), warning: c("33;1", "warning") };
   const files = r.project.files.filter((f) => f.kind === "source").length;
   const sql = r.project.files.filter((f) => f.kind === "sql").length;
-  const out = [c("1", `vibe-preflight ${VERSION}`) + c("2", ` \xB7 ${r.project.name} \xB7 ${plural(files, "source file")}, ${plural(sql, "SQL file")} \xB7 ${plural(r.rules.length, "check")}`), ""];
+  const py = r.project.files.filter((f) => f.kind === "python").length;
+  const fileCounts = [plural(files, "source file"), ...py ? [plural(py, "Python file")] : [], plural(sql, "SQL file")].join(", ");
+  const out = [c("1", `vibe-preflight ${VERSION}`) + c("2", ` \xB7 ${r.project.name} \xB7 ${fileCounts} \xB7 ${plural(r.rules.length, "check")}`), ""];
   for (const f of r.findings) {
     out.push(`${tag[f.severity]} ${c("2", `${f.file}:${f.line}`)}`);
     out.push(`        ${f.message} ${c("2", `[${f.rule}]`)}`);
@@ -1790,7 +2318,7 @@ Options
   -f, --format <text|json>              output format (default: text)
   -e, --explain                         text output: add why each finding matters and how to fix it
       --fail-on <error|warning|never>   exit 1 when a finding at this level or above exists (default: error)
-      --only <group|rule,...>           run only these checks; groups: database, secrets, stripe, breaking
+      --only <group|rule,...>           run only these checks; groups: database, secrets, stripe, breaking, concurrency
       --skip <rule,rule>                turn checks off for this run
       --today <YYYY-MM-DD>              judge date-based checks as of this day (e.g. 2026-12-01)
       --no-color                        plain text (NO_COLOR is respected too)

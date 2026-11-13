@@ -15,7 +15,7 @@ Options
   -f, --format <text|json>              output format (default: text)
   -e, --explain                         text output: add why each finding matters and how to fix it
       --fail-on <error|warning|never>   exit 1 when a finding at this level or above exists (default: error)
-      --only <group|rule,...>           run only these checks; groups: database, secrets, stripe, breaking
+      --only <group|rule,...>           run only these checks; groups: database, secrets, stripe, breaking, concurrency
       --skip <rule,rule>                turn checks off for this run
       --today <YYYY-MM-DD>              judge date-based checks as of this day (e.g. 2026-12-01)
       --no-color                        plain text (NO_COLOR is respected too)

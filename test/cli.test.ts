@@ -69,7 +69,7 @@ describe("preflight.mjs", () => {
     expect(run(broken, "--fail-on", "never").code).toBe(0);
     const skipped = run(broken, "--format", "json", "--skip", "rls-disabled,env-file-committed");
     expect(JSON.parse(skipped.out).findings.map((f: { rule: string }) => f.rule)).not.toContain("rls-disabled");
-    expect(JSON.parse(skipped.out).rules).toHaveLength(17);
+    expect(JSON.parse(skipped.out).rules).toHaveLength(19);
   });
 
   it("exits 2 with a message on bad input", () => {
@@ -80,10 +80,10 @@ describe("preflight.mjs", () => {
     }
   });
 
-  it("lists the 19 checks", () => {
+  it("lists the 21 checks", () => {
     const r = run("--list");
     expect(r.code).toBe(0);
-    expect(r.out.trim().split("\n")).toHaveLength(19);
+    expect(r.out.trim().split("\n")).toHaveLength(21);
   });
 
   it("--today moves the adapter removal date check: warning before 2026-12-01, failing error from it", () => {

@@ -1,0 +1,23 @@
+PostgreSQL 18.6, 20 rounds per strategy, two requests per round
+
+Order 'o1' (pending -> paid):
+┌─────────┬─────────────────────────────────────────────────────┬──────────┬────────┬───────────────────┐
+│ (index) │ strategy                                            │ both won │ errors │ final values seen │
+├─────────┼─────────────────────────────────────────────────────┼──────────┼────────┼───────────────────┤
+│ 0       │ 'pool.query + FOR UPDATE (no transaction)'          │ '20/20'  │ 0      │ 'paid'            │
+│ 1       │ 'client.query + FOR UPDATE, no BEGIN'               │ '20/20'  │ 0      │ 'paid'            │
+│ 2       │ "pool.query('BEGIN') + FOR UPDATE via pool"         │ '0/20'   │ 0      │ 'paid'            │
+│ 3       │ 'same, while one other request uses the pool'       │ '20/20'  │ 0      │ 'paid'            │
+│ 4       │ 'one client: BEGIN, FOR UPDATE, UPDATE, COMMIT'     │ '0/20'   │ 0      │ 'paid'            │
+│ 5       │ 'SELECT status, then UPDATE by id (check-then-act)' │ '20/20'  │ 0      │ 'paid'            │
+│ 6       │ "UPDATE ... WHERE status = 'pending' RETURNING"     │ '0/20'   │ 0      │ 'paid'            │
+└─────────┴─────────────────────────────────────────────────────┴──────────┴────────┴───────────────────┘
+Wallet 'w1' (balance 100, two withdrawals of 80):
+┌─────────┬─────────────────────────────────────────────────────────────┬──────────┬────────┬───────────────────┐
+│ (index) │ strategy                                                    │ both won │ errors │ final values seen │
+├─────────┼─────────────────────────────────────────────────────────────┼──────────┼────────┼───────────────────┤
+│ 0       │ 'pool.query + FOR UPDATE (no transaction)'                  │ '20/20'  │ 0      │ '20'              │
+│ 1       │ 'one client: BEGIN, FOR UPDATE, UPDATE, COMMIT'             │ '0/20'   │ 0      │ '20'              │
+│ 2       │ 'UPDATE ... SET balance = balance - 80 WHERE balance >= 80' │ '0/20'   │ 0      │ '20'              │
+└─────────┴─────────────────────────────────────────────────────────────┴──────────┴────────┴───────────────────┘
+Connections left 'idle in transaction' at the end: 2

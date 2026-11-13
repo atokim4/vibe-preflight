@@ -2,7 +2,7 @@ import type { Rule, Severity } from "./types.ts";
 import { counts, type ScanResult } from "./engine.ts";
 import { allRules } from "./rules/index.ts";
 
-export const VERSION = "1.6.1";
+export const VERSION = "1.7.0";
 
 const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? "" : "s"}`;
 
@@ -36,7 +36,9 @@ export function text(r: ScanResult, color: boolean, explain: boolean): string {
   const tag: Record<Severity, string> = { error: c("31;1", "error  "), warning: c("33;1", "warning") };
   const files = r.project.files.filter((f) => f.kind === "source").length;
   const sql = r.project.files.filter((f) => f.kind === "sql").length;
-  const out = [c("1", `vibe-preflight ${VERSION}`) + c("2", ` · ${r.project.name} · ${plural(files, "source file")}, ${plural(sql, "SQL file")} · ${plural(r.rules.length, "check")}`), ""];
+  const py = r.project.files.filter((f) => f.kind === "python").length;
+  const fileCounts = [plural(files, "source file"), ...(py ? [plural(py, "Python file")] : []), plural(sql, "SQL file")].join(", ");
+  const out = [c("1", `vibe-preflight ${VERSION}`) + c("2", ` · ${r.project.name} · ${fileCounts} · ${plural(r.rules.length, "check")}`), ""];
 
   for (const f of r.findings) {
     out.push(`${tag[f.severity]} ${c("2", `${f.file}:${f.line}`)}`);

@@ -14,9 +14,12 @@ export function fileKind(path: string): SourceFile["kind"] | undefined {
   const name = path.slice(slash + 1);
   const dir = slash === -1 ? "" : path.slice(0, slash);
   if (SOURCE_EXT.test(name) && !name.endsWith(".d.ts")) return "source";
+  if (name.endsWith(".py")) return "python";
   if (name.endsWith(".sql")) return "sql";
   if (ENV_FILE.test(name)) return "env";
   if (name === "package.json" || name === ".gitignore") return "other";
+  // Python dependency lists: the concurrency checks read them to tell asyncpg projects apart.
+  if (/^(requirements[^/]*\.txt|pyproject\.toml|Pipfile|setup\.cfg)$/.test(name)) return "other";
   if (name === "config.toml" && (dir === "supabase" || dir.endsWith("/supabase"))) return "other";
   return undefined;
 }

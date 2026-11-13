@@ -9,6 +9,7 @@ export { utcToday } from "./model.ts";
 export const SKIP_DIRS = new Set([
   "node_modules", ".git", ".next", ".nuxt", ".output", ".vercel", ".netlify", ".turbo", ".cache", ".expo",
   "dist", "build", "out", "coverage", ".svelte-kit", "vendor", ".pnpm-store", "playwright-report", "test-results",
+  ".venv", "venv", "__pycache__", "site-packages", ".tox", ".mypy_cache", ".pytest_cache", ".ruff_cache",
 ]);
 const MAX_FILE_BYTES = 1_000_000;
 /** The bundled scanner contains the patterns it looks for. */

@@ -16,7 +16,7 @@ export interface SourceFile {
   /** Relative path, forward slashes. */
   path: string;
   text: string;
-  kind: "source" | "sql" | "env" | "other";
+  kind: "source" | "python" | "sql" | "env" | "other";
 }
 
 export type Framework = "next" | "vite" | "expo" | "unknown";

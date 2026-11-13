@@ -1,6 +1,6 @@
 # vibe-preflight
 
-An Agent Skill for Claude Code, Codex and other coding agents that checks a Supabase + Stripe app for 19
+An Agent Skill for Claude Code, Codex and other coding agents that checks a Supabase + Stripe app for 21
 common launch blockers before you deploy it. The same checks also run as a GitHub Action on pull requests
 (see [Use in CI](#use-in-ci)). Its upgrade checks (`--only breaking` and the grants checks) also run in the browser at
 [upgrade-check-2026.netlify.app](https://upgrade-check-2026.netlify.app), on any public GitHub repo. It ships with a small Node scanner (one file, no dependencies)
@@ -13,7 +13,9 @@ generated with AI tools: RLS left off, template policies, views and functions th
 the service role key in the browser, Stripe webhooks that trust any POST, and the Data API grants that
 Supabase stopped adding to new tables on 2026-10-30. Two more catch Supabase breaking changes before they
 break a deploy: the `@supabase/server` framework adapters removed on 2026-12-01, and direct writes to
-pg_cron's `cron.job` table.
+pg_cron's `cron.job` table. The last two work on any Postgres app (Node or Python, with or without Supabase):
+`SELECT … FOR UPDATE` that runs outside a transaction, so the row lock is gone before the write, and a status
+read followed by an `UPDATE` that never re-checks it. See [Row locks that end too early](#row-locks-that-end-too-early).
 
 ## Install
 
@@ -31,7 +33,7 @@ Or as a Claude Code plugin (the repo is its own plugin marketplace):
 The repo holds four skills. `npx skills add atokim4/vibe-preflight` offers all of them; to take just one:
 
 ```bash
-npx skills add atokim4/vibe-preflight --skill vibe-preflight            # all 19 checks
+npx skills add atokim4/vibe-preflight --skill vibe-preflight            # all 21 checks
 npx skills add atokim4/vibe-preflight --skill supabase-rls-audit        # the 12 database checks
 npx skills add atokim4/vibe-preflight --skill stripe-webhook-security   # the 2 Stripe checks + a review list
 npx skills add atokim4/vibe-preflight --skill upwork-proposal-lint      # proposal linter, unrelated to security
@@ -59,7 +61,7 @@ or without installing anything: `npx github:atokim4/vibe-preflight path/to/app`.
 
 ## Use in CI
 
-The repo is also a GitHub Action. It runs the same 19 checks, writes a SARIF file that code scanning turns
+The repo is also a GitHub Action. It runs the same 21 checks, writes a SARIF file that code scanning turns
 into alerts, adds a table of findings with the fix for each check to the job summary, and annotates the
 lines in the pull request diff. Copy this into `.github/workflows/vibe-preflight.yml`:
 
@@ -106,7 +108,7 @@ summary, the annotations and the failing check.
 | `path` | `.` | Folder to scan, relative to the repo root. Set it to the app folder in a monorepo |
 | `fail-on` | `error` | `error`, `warning` or `none`. The step fails when a finding at that level or above exists |
 | `format` | `sarif` | `sarif` writes the SARIF file and the job summary, `markdown` only the job summary |
-| `include` | all checks | Groups (`database`, `secrets`, `stripe`) or check ids, comma- or newline-separated |
+| `include` | all checks | Groups (`database`, `secrets`, `stripe`, `breaking`, `concurrency`) or check ids, comma- or newline-separated |
 | `exclude` | none | Check ids to turn off |
 | `sarif-file` | `vibe-preflight.sarif` | Where the SARIF file goes, relative to the repo root |
 
@@ -124,7 +126,7 @@ step, so on a big first run the job summary and the code scanning tab are where 
 The action needs no token and makes no network calls. It reads the checked-out files and runs `git
 ls-files`, like the CLI.
 
-## The 19 checks
+## The 21 checks
 
 | Check | Severity | What it finds |
 |---|---|---|
@@ -147,8 +149,48 @@ ls-files`, like the CLI.
 | `env-file-committed` | error / warning | An `.env*` file with values that git tracks or doesn't ignore. Warning only when it holds just the Supabase CLI's local demo keys or just public variables |
 | `server-adapter-removed` | warning, error from 2026-12-01 | An import of `@supabase/server/adapters/{hono,h3,elysia,nestjs}`, and each `withSupabase(...)` registration with its `auth` value and the exact bridge call that replaces it. Reads the deprecated `allow` option and mode lists too. Notes a `package.json` range below 1.6.0 and a missing `@supabase/middleware`, and flags leftover `supabaseContext` reads |
 | `cron-job-direct-write` | warning | `insert into cron.job` / `update cron.job` in `supabase/migrations/*.sql` or `seed.sql`, also inside DO blocks and function bodies, with the `cron.schedule` / `cron.schedule_in_database` / `cron.alter_job` rewrite |
+| `for-update-autocommit` | error | `SELECT … FOR UPDATE` / `FOR SHARE` that holds no lock past the statement: node-postgres `pool.query` (each call is its own connection, so a `BEGIN` sent through the pool doesn't help), a client with no `BEGIN` in that function, Prisma `$queryRaw` outside `$transaction(async (tx) => …)`, Drizzle `.for('update')` and Knex `.forUpdate()` outside a transaction, Sequelize `lock` without `transaction`, asyncpg outside `conn.transaction()`, psycopg / SQLAlchemy when the project turns on autocommit. A connection passed in as a parameter is left alone (the caller may hold the transaction) |
+| `check-then-act` | warning | Raw SQL in one function that reads `status` / `balance` / `stock`-style columns and then sets them with an `UPDATE … WHERE id = …` that doesn't re-check the value (`balance = balance - $1` is fine). JS/TS and Python |
 
 `SKILL.md` explains each one with the fix. The scanner also prints the why and the fix with `--explain`.
+
+## Row locks that end too early
+
+A row lock lasts until the transaction ends ([PostgreSQL docs](https://www.postgresql.org/docs/current/explicit-locking.html#LOCKING-ROWS)).
+In autocommit every statement is a transaction of its own, so `SELECT … FOR UPDATE` locks the row for as long
+as the SELECT takes and then lets go. The code that reads `status = 'pending'`, calls Stripe or Telegram and then
+writes `paid` is not protected at all. node-postgres
+[says it plainly](https://node-postgres.com/features/transactions): use the same client for every statement of
+a transaction, and don't run transactions through `pool.query`.
+
+[`examples/for-update-repro`](examples/for-update-repro) races two requests for the same order and the same
+wallet on a real PostgreSQL 18 server with separate connections, 20 rounds per strategy. From
+[`OUTPUT.txt`](examples/for-update-repro/OUTPUT.txt):
+
+| Strategy | Both requests won |
+|---|---|
+| `pool.query` + `FOR UPDATE`, no transaction | 20/20 |
+| `client.query` + `FOR UPDATE`, no `BEGIN` | 20/20 |
+| `pool.query('BEGIN')` + `FOR UPDATE` through the pool | 0/20 |
+| the same, while one other request uses the pool | 20/20 (and 2 connections left "idle in transaction") |
+| one client: `BEGIN`, `FOR UPDATE`, `UPDATE`, `COMMIT` | 0/20 |
+| `SELECT status`, then `UPDATE … WHERE id` | 20/20 |
+| `UPDATE … WHERE status = 'pending' RETURNING` | 0/20 |
+| wallet, 100 minus two withdrawals of 80, `pool.query` + `FOR UPDATE` | 20/20, final balance 20 |
+| wallet, `SET balance = balance - 80 WHERE balance >= 80` | 0/20 |
+
+The `pool.query('BEGIN')` row is the dangerous one: it looks right and passes a quiet test, because the pool
+hands the same idle connection back. Under any other traffic the statements spread over connections. Running
+the scanner on the repro flags exactly the five broken strategies and none of the four correct ones.
+
+Two things need no check. Django raises `TransactionManagementError` when a `select_for_update()` queryset runs
+outside `transaction.atomic()` ([docs](https://docs.djangoproject.com/en/5.2/ref/models/querysets/#select-for-update)).
+Supabase `.rpc()` calls run inside one transaction per request ([PostgREST](https://docs.postgrest.org/en/stable/references/transactions.html)),
+so `FOR UPDATE` inside a plpgsql function called that way holds its lock until the function returns.
+
+```bash
+cd examples/for-update-repro && npm install && npm start   # downloads a PostgreSQL 18 binary (embedded-postgres)
+```
 
 ## Supabase's 2026-10-30 grants change
 
@@ -222,7 +264,7 @@ bind. It doesn't prove anything about pg_cron itself.
 -f, --format <text|json>              output format (default: text)
 -e, --explain                         add why each finding matters and how to fix it
     --fail-on <error|warning|never>   exit 1 at this level or above (default: error)
-    --only <group|rule,...>           run only these checks; groups: database, secrets, stripe, breaking
+    --only <group|rule,...>           run only these checks; groups: database, secrets, stripe, breaking, concurrency
     --skip <rule,rule>                turn checks off for this run
     --today <YYYY-MM-DD>              judge date-based checks as of this day (default: today, UTC)
     --list                            list the checks

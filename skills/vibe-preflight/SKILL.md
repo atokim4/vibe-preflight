@@ -1,6 +1,6 @@
 ---
 name: vibe-preflight
-description: Pre-launch security scan for Supabase + Stripe apps (Next.js, Vite, Expo; Lovable, Bolt, Cursor and Claude Code builds). Finds public tables without Row Level Security, `using (true)` policies, user-editable plan/role columns, views and SECURITY DEFINER functions that skip RLS, `auth.users` exposed through a view, public storage buckets, missing or leaking Data API grants after Supabase's 2026-10-30 change (42501 permission denied for table), the service_role key in browser code, secrets in NEXT_PUBLIC_/VITE_/EXPO_PUBLIC_ variables, Stripe webhooks that skip signature checks or check them against a parsed body, .env files in git, imports of the @supabase/server framework adapters (Hono, H3, Elysia, NestJS) that Supabase removes on 2026-12-01, and direct INSERT/UPDATE on pg_cron's cron.job table. Use before deploying, before making a repo public, when reviewing a vibe-coded or AI-generated app, or when the user asks "is my Supabase/Stripe app safe to launch?".
+description: Pre-launch security scan for Supabase + Stripe apps (Next.js, Vite, Expo; Lovable, Bolt, Cursor and Claude Code builds). Finds tables without Row Level Security, `using (true)` policies, user-editable plan/role columns, views and SECURITY DEFINER functions that skip RLS, exposed `auth.users`, public buckets, missing or leaking Data API grants after Supabase's 2026-10-30 change (42501 permission denied), the service_role key in browser code, secrets in NEXT_PUBLIC_/VITE_/EXPO_PUBLIC_ variables, unverified Stripe webhooks, .env files in git, the @supabase/server adapters removed on 2026-12-01, direct writes to cron.job, and Postgres races (SELECT ... FOR UPDATE outside a transaction, status checks an UPDATE never re-checks) behind double bookings and double payments. Use before deploying, before making a repo public, when reviewing a vibe-coded or AI-generated app, or when the user asks "is my Supabase/Stripe app safe to launch?".
 license: MIT
 ---
 
@@ -8,8 +8,8 @@ license: MIT
 
 A zero-dependency Node 20+ scanner ships in `scripts/preflight.mjs` next to this file. It reads the project's
 files and asks `git` which of them are tracked. It doesn't run the app, install anything or use the network.
-It reports 19 problems that keep showing up in apps built quickly with AI tools, two of them Supabase
-breaking changes.
+It reports 21 problems that keep showing up in apps built quickly with AI tools, two of them Supabase
+breaking changes and two of them races in Postgres code (any Node or Python app, Supabase or not).
 
 ## When to run it
 
@@ -17,7 +17,8 @@ breaking changes.
 - You just wrote or changed Supabase migrations, RLS policies, env variables, or a Stripe webhook.
 - The user asks for a security review of a Next.js / Vite / Expo app with Supabase.
 
-Skip it for projects with neither Supabase nor Stripe; only the env checks would apply.
+For a project with neither Supabase nor Stripe that talks to Postgres (bookings, wallets, Telegram shop
+bots), run `--only concurrency`: the other checks would not apply.
 
 ## How to run it
 
@@ -239,9 +240,37 @@ Inside a DO block or a plpgsql function use `perform` instead of `select`. Anoth
 `alter_job` parameter: `cron.unschedule('<old>')` then `cron.schedule('<new>', …)`. Don't edit a migration
 that already ran on production; add a new one.
 
+### `for-update-autocommit` (error)
+
+The row lock from `SELECT … FOR UPDATE` lasts until the transaction ends. Outside a transaction that is the end
+of the SELECT, so two requests both read `pending` and both write. Fix it one of two ways:
+
+- One statement does the check and the write, no lock needed:
+  `UPDATE orders SET status = 'paid' WHERE id = $1 AND status = 'pending' RETURNING id`. Zero rows back means
+  another request got there first: answer "already paid", don't charge or deliver again.
+- Or keep the SELECT and wrap it: node-postgres `const c = await pool.connect()`, then `BEGIN`, the SELECT, the
+  UPDATE and `COMMIT` on `c`, `ROLLBACK` in `catch`, `c.release()` in `finally`. Never `pool.query('BEGIN')`:
+  every `pool.query` can take a different connection. Prisma: `prisma.$transaction(async (tx) => …)` and
+  `tx.$queryRaw`. Drizzle: `db.transaction(async (tx) => …)` and `tx.select()…for('update')`. Knex:
+  `knex.transaction(async (trx) => …)` or `.transacting(trx)`. Sequelize: `{ transaction: t, lock: t.LOCK.UPDATE }`.
+  asyncpg: `async with pool.acquire() as conn, conn.transaction():`. psycopg with autocommit on:
+  `with conn.transaction():`.
+
+Keep slow calls (Stripe, Telegram, email) out of the locked transaction when you can; the lock blocks every
+other request for that row while it is held. A function that gets the client as a parameter is not reported:
+check that its callers open the transaction. Django `select_for_update()` and Supabase `.rpc()` need nothing.
+
+### `check-then-act` (warning)
+
+The code reads a status, balance or stock, decides in application code, then writes with `WHERE id = $1`.
+Move the condition into the write: `… WHERE id = $1 AND status = 'pending'`, or a relative update
+`SET balance = balance - $2 WHERE id = $1 AND balance >= $2`, and act on the row count. If the decision really
+needs the row first, read it with `FOR UPDATE` inside the transaction that writes. Raw SQL only: ORM
+read-modify-write (`product.stock -= qty` then commit) has the same race and isn't scanned.
+
 ## Limits (tell the user when it matters)
 
-- Static checks only, 19 of them. A clean run doesn't mean the app is secure: auth flows, rate limits,
+- Static checks only, 21 of them. A clean run doesn't mean the app is secure: auth flows, rate limits,
   business logic and what happens inside function bodies are out of scope.
 - RLS checks read `.sql` files (Supabase migrations, `schema.sql`). Policies created only in the dashboard
   are invisible; suggest `supabase db pull` to get them into migrations.
